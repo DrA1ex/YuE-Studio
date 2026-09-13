@@ -1,3 +1,59 @@
+> **This is an Apple Silicon fork of YuE2.** It adds a native macOS app (**YuE Studio**), a
+> pipelined worker that runs the three stages of a song on the GPU and the Neural Engine at once,
+> synthesis engines for the Neural Engine and for MLX, a lean loader for 16 GB Macs, a fast draft
+> mode, and an instrumental switch. Everything below the next section is the upstream README from
+> [multimodal-art-projection/YuE](https://github.com/multimodal-art-projection/YuE); the model,
+> its weights and its licence are theirs.
+
+## YuE2 on Apple Silicon (this fork)
+
+**What it adds**
+
+- **YuE Studio** (`app/YuEStudio`): a SwiftUI app that installs its own Python runtime and the
+  model on first launch, queues songs, and shows each one moving through Planning, Tokenizing,
+  Synthing and Rendering with live throughput. Drafts (8 solver steps on the GPU) preview a song
+  in a few minutes; "Render full quality" reuses the same tokens and seed at 32 steps.
+- **A pipelined worker** (`tools/yue2_worker.py`): tokens on the GPU, synthesis on the Neural
+  Engine (or MLX), waveform rendering on the GPU, all overlapping across queued songs. A song
+  waiting for the Neural Engine can start on the GPU and move across mid-solve.
+- **Neural Engine synthesis** (`src/yue2/ane/`): the flow-matching network compiled to the
+  Neural Engine through a private in-memory route, one program per length bucket with the
+  weights bound as inputs. About 2x the GPU on short songs.
+- **MLX synthesis** (`src/yue2/nar_mlx.py`), **batched token decoding** (`src/yue2/batched.py`),
+  a **lean loader** that keeps only the autoregressive path in PyTorch (`src/yue2/lean.py`), and
+  an **instrumental mode** that silences the vocal voice of the planned score
+  (`src/yue2/instrumental.py`).
+
+Details, measurements and the reasoning behind each piece are in
+[docs/apple-silicon.md](docs/apple-silicon.md).
+
+**Requirements.** A Mac with Apple Silicon and macOS 14 or later; 32 GB of memory is
+comfortable, 16 GB works with the lean loader (the worker adapts its settings). About 10 GB of
+disk for the runtime and the model weights.
+
+**Run the app from a release.** Download `YuE-Studio.dmg` from the Releases page, drag the app
+to Applications, launch it and press Install: it sets up a private Python, installs this
+package, and downloads the weights (about 7 GB) once.
+
+**Run from source.**
+
+```bash
+uv venv .venv --python 3.12 && source .venv/bin/activate
+uv pip install -e '.[apple,test]'
+(cd src/yue2/ane && clang -O2 -fobjc-arc -dynamiclib libyue2ane.m -o libyue2ane.dylib \
+    -framework Foundation -framework IOSurface)     # Neural Engine bridge
+yue2 generate --request examples/song.json --device mps --output outputs/first-song
+cd app/YuEStudio && swift run                        # the app, using this checkout's worker
+```
+
+`bash app/package.sh` builds the app bundle and a DMG (ad hoc signed by default; set
+`SIGN_IDENTITY` and `NOTARY_PROFILE` for a notarized build).
+
+**Licence.** The code in this fork keeps the upstream Apache-2.0 licence (`LICENSE`); the model
+weights are under the upstream `MODEL_LICENSE`. Third-party notices are unchanged.
+
+---
+
 > Looking for the original YuE? Its code, documentation, and license are preserved on the **[YuE-v1 branch](https://github.com/multimodal-art-projection/YuE/tree/YuE-v1)**.
 
 <p align="center">

@@ -121,7 +121,10 @@ class SongResult:
 class YuE2Pipeline:
     def __init__(self, model_dir, vae_dir, *, device="auto", memory_budget_gib=24,
                  backend="torch", generation_config=None, verify_hashes=True,
-                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True):
+                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True, lean=False):
+        """``lean=True`` keeps only the AR path in PyTorch (weights streamed from disk to the
+        device); synthesis must then use the ane or mlx engine, which read the NAR weights from
+        the checkpoint themselves. Halves the resident model on Apple Silicon."""
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         self.progress = progress
@@ -147,6 +150,9 @@ class YuE2Pipeline:
         self.memory_budget_gib = float(memory_budget_gib)
         self.vae_core_frames = vae_core_frames if vae_core_frames is not None else (512 if memory_budget_gib <= 12 else 1024)
         self.offload_ar = offload_ar
+        self.lean = bool(lean)
+        if self.lean and (quantization != "none" or backend == "vllm"):
+            raise ValueError("lean loading supports the plain torch backend only")
         self.generation_config = generation_config or GenerationConfig()
         self.tokenizer = YuE2TextTokenizer(self.model_dir / "qwen.tiktoken")
         with self._status("Verifying model files"):
@@ -211,10 +217,14 @@ class YuE2Pipeline:
         loading = self._model is None or next(self._model.parameters()).device != self.device
         with self._status("Loading model") if loading else nullcontext():
             if self._model is None:
-                from .modeling_yue2 import YuE2ForCausalLM
                 start = time.perf_counter()
-                self._model = YuE2ForCausalLM.from_pretrained(self.model_dir, local_files_only=True,
-                              torch_dtype=torch.bfloat16, low_cpu_mem_usage=True).eval()
+                if self.lean:
+                    from .lean import load_model
+                    self._model = load_model(self.model_dir, self.device, nar=False)
+                else:
+                    from .modeling_yue2 import YuE2ForCausalLM
+                    self._model = YuE2ForCausalLM.from_pretrained(self.model_dir, local_files_only=True,
+                                  torch_dtype=torch.bfloat16, low_cpu_mem_usage=True).eval()
                 self.load_timing["mot_load_seconds"] = time.perf_counter() - start
             if self.quantization == "fp8" and not for_nar:
                 from .quantization import prepare_fp8_ar
@@ -317,10 +327,13 @@ class YuE2Pipeline:
     def __exit__(self, *exc):
         self.close()
 
-    def decode(self, latents, *, full=False, vae=None):
+    def decode(self, latents, *, full=False, vae=None, on_progress=None):
+        """Latents [T,64] -> waveform [samples, channels]; ``on_progress(done, total)`` after each tile."""
         from .modeling_vae import YuE2VAE
         with self._status("Loading audio decoder"):
-            if self._model is not None:
+            # Unified memory: parking the LM on the CPU would cost a full copy each way, so only
+            # discrete GPUs move it.
+            if self._model is not None and self.device.type == "cuda":
                 self._model.to("cpu")
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -339,7 +352,13 @@ class YuE2Pipeline:
         try:
             tiles = 1 if full else (z.shape[-1] + self.vae_core_frames - 1) // self.vae_core_frames
             with self._status("Decoding audio", total=tiles, unit="chunks") as status:
-                report = (lambda completed, total: status.update(completed, total=total)) if self.progress else None
+                def report(completed, total):
+                    if self.progress:
+                        status.update(completed, total=total)
+                    if on_progress is not None:
+                        on_progress(completed, total)
+                if not self.progress and on_progress is None:
+                    report = None                      # nothing listens: keep the decoder's fast path
                 with torch.inference_mode():
                     if full:
                         audio = model.decode(z.to(self.device)).cpu()
@@ -354,6 +373,8 @@ class YuE2Pipeline:
             model.to("cpu")
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
+            elif self.device.type == "mps":
+                torch.mps.empty_cache()
 
     def effective_config(self, request, abc_sampling=None, semantic_sampling=None):
         config = self.generation_config.to_dict()

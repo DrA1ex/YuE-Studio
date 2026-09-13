@@ -48,14 +48,42 @@ def song_chunks(prefix, codec, seed, context=CONTEXT):
             for a, b in ranges]
 
 
+def _matmul_attention(q, k, v, block=1024):
+    """Grouped attention as contiguous batched matmuls; no K/V head copies.
+
+    q [S, H, D]; k, v [L, KV, D]. On MPS the fused SDPA kernel runs at under
+    1 TFLOP/s for long non-causal attention; contiguous [KV, g, S, D] matmuls
+    with a fused bf16 softmax run more than twice as fast.
+    """
+    S, H, D = q.shape
+    L, KV, _ = k.shape
+    g = H // KV
+    qh = q.view(S, KV, g, D).permute(1, 2, 0, 3).contiguous()          # [KV, g, S, D]
+    kt = k.transpose(0, 1).unsqueeze(1).transpose(-1, -2).contiguous()  # [KV, 1, D, L]
+    vh = v.transpose(0, 1).unsqueeze(1).contiguous()                    # [KV, 1, L, D]
+    scale = D ** -0.5
+    outputs = []
+    for start in range(0, S, block):
+        scores = torch.matmul(qh[:, :, start:start + block], kt) * scale
+        # torch.softmax in bf16 is 2.5x faster on MPS than an unfused max/exp/sum.
+        outputs.append(torch.matmul(torch.softmax(scores, -1), vh))
+    return torch.cat(outputs, 2).permute(2, 0, 1, 3).reshape(S, H, D)
+
+
 def attention(q, k, v, *, causal=False, backend="sdpa", query_chunk_size=None):
     """Attend [tokens, heads, dim] tensors without materializing a song mask.
 
     CPU/MPS bound the number of query rows for a potential math SDPA fallback.
     CUDA normally uses PyTorch's fused SDPA without an external flash package.
+    On MPS, non-causal attention defaults to ``matmul`` (see _matmul_attention);
+    pass backend="sdpa-legacy" to force the original fused-kernel path.
     """
-    if backend not in {"sdpa", "math", "flash"}:
-        raise ValueError("attention must be sdpa, math, or flash")
+    if backend not in {"sdpa", "sdpa-legacy", "math", "flash", "matmul"}:
+        raise ValueError("attention must be sdpa, sdpa-legacy, math, flash, or matmul")
+    if backend == "sdpa" and q.device.type == "mps" and not causal:
+        backend = "matmul"
+    if backend == "sdpa-legacy":
+        backend = "sdpa"
     if q.ndim != 3 or k.ndim != 3 or v.shape != k.shape or q.shape[-1] != k.shape[-1]:
         raise ValueError("Expected Q/K/V [tokens, heads, dim] with matching K/V")
     if min(q.shape) < 1 or min(k.shape) < 1 or q.shape[1] % k.shape[1]:
@@ -67,6 +95,10 @@ def attention(q, k, v, *, causal=False, backend="sdpa", query_chunk_size=None):
     if query_chunk_size is not None and (isinstance(query_chunk_size, bool) or
                                         not isinstance(query_chunk_size, Integral) or query_chunk_size < 1):
         raise ValueError("query_chunk_size must be a positive integer")
+    if backend == "matmul":
+        if causal:
+            raise ValueError("matmul attention is for non-causal (NAR) attention")
+        return _matmul_attention(q, k, v, block=query_chunk_size or 1024)
     block = query_chunk_size or (len(q) if q.device.type == "cuda" and backend != "math" else 256)
     query = q.transpose(0, 1).unsqueeze(0)
     key = k.transpose(0, 1).unsqueeze(0)
@@ -228,8 +260,15 @@ def _offload_ar(model, enabled):
 def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
                steps=32, context=CONTEXT, attention="sdpa", offload_ar=False,
                cancelled=None, query_chunk_size=None,
-               on_progress: Callable[[int, int], None] | None = None):
+               on_progress: Callable[[int, int], None] | None = None, engine="auto",
+               on_prepare: Callable[[int, int], None] | None = None, lock=None,
+               on_phase: Callable[[str], None] | None = None):
     """Return CPU FP32 [frames,64] latents, solving original chunks serially.
+
+    ``lock`` (a context manager) is held whenever this call runs PyTorch work on
+    the model's device (the prefix prefill, weight copies, the torch solver) and
+    released while the mlx/ane solvers run, so another thread can share the
+    device (see locks.FairLock).
 
     Defaults preserve the release protocol. Explicit steps/context overrides
     belong in the caller's effective configuration record. ``offload_ar`` is
@@ -240,12 +279,53 @@ def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
     """
     if model.training:
         raise ValueError("synthesize requires model.eval()")
+    import os
+    if engine not in {"auto", "torch", "mlx", "ane"}:
+        raise ValueError("engine must be auto, torch, mlx, or ane")
+    if engine == "auto":
+        engine = os.environ.get("YUE2_NAR_ENGINE", "auto")
+    if engine == "auto":
+        from . import nar_mlx
+        from .ane import runtime as ane_runtime
+        if next(model.parameters()).device.type == "mps" and ane_runtime.available():
+            engine = "ane"
+        elif nar_mlx.available() and next(model.parameters()).device.type == "mps":
+            engine = "mlx"
+        else:
+            engine = "torch"
+    use_mlx, use_ane = engine == "mlx", engine == "ane"
+    from .lean import is_lean
+    lock = nullcontext() if lock is None else lock
+    phase = on_phase if on_phase is not None else (lambda text: None)
+    if engine == "torch" and is_lean(model):
+        raise ValueError("The PyTorch synthesis engine needs the full model; this one was loaded lean (ane/mlx only)")
+    if use_mlx:
+        from . import nar_mlx
+        with lock:
+            mlx_weights = nar_mlx.weights_for(model)
+    if use_ane:
+        from .ane import runtime as ane_runtime
+        if getattr(model, "_yue2_ane_weights", None) is None:
+            phase("loading weights onto the Neural Engine")
+        if is_lean(model):
+            ane_runtime.weights_for(model)            # read from the checkpoint: no device work
+        else:
+            with lock:
+                ane_runtime.weights_for(model)
     chunks = song_chunks(prefix, codec, seed, context)
     output = []
     for chunk_index, chunk in enumerate(chunks):
         if cancelled is not None and cancelled():
             raise InterruptedError("Cancelled before acoustic prefill")
-        engine = CachedNAR(model, chunk, attention, query_chunk_size)
+        if use_ane:
+            # Compile (or load) the bucket's programs before taking the device lock: the compiler
+            # can run for minutes and needs no PyTorch work.
+            S, P = ane_runtime.buckets_for((len(chunk.noise) + 2, len(chunk.ar_tokens)))
+            ane_runtime.programs_for(model).ensure(S, P, on_progress=on_prepare)
+        phase("prefilling the prefix on the GPU")
+        with lock:
+            engine = CachedNAR(model, chunk, attention, query_chunk_size)
+        phase("solver step 1 running")
         # Drop the prefix cache before restoring AR weights, including on
         # cancellation/failure, to keep the restoration memory peak bounded.
         with _offload_ar(model, offload_ar):
@@ -254,8 +334,23 @@ def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
                 if on_progress is not None:
                     def progress(completed, total):
                         on_progress(chunk_index * total + completed, total * len(chunks))
-                output.append(engine.solve(steps, cancelled, on_progress=progress))
+                if use_mlx:
+                    with lock:
+                        solver = nar_mlx.MLXVelocity(engine, mlx_weights)
+                    output.append(solver.solve(chunk.noise, steps, cancelled, on_progress=progress))
+                    del solver
+                elif use_ane:
+                    with lock:
+                        solver = ane_runtime.ANEVelocity(engine, model, on_prepare=on_prepare)
+                    try:
+                        output.append(solver.solve(chunk.noise, steps, cancelled, on_progress=progress))
+                    finally:
+                        solver.close()
+                else:
+                    with lock:
+                        output.append(engine.solve(steps, cancelled, on_progress=progress))
             finally:
-                engine.close()
+                with lock:
+                    engine.close()
         del engine
     return torch.cat(output, dim=0)

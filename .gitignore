@@ -21,3 +21,18 @@ runs/
 *.whl
 *.partial
 .DS_Store
+
+# Apple Silicon fork: build products, generated artefacts, local data
+outputs/
+dist/
+build/
+app/YuEStudio/.build/
+*.dmg
+*.dylib
+.DS_Store
+.claude/
+tools/ane/models/
+tools/ane/*.data
+tools/ane/introspect
+tools/ane/ane_synth_probe
+requests/
