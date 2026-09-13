@@ -27,7 +27,8 @@ apple = ["mlx>=0.30", "coremltools>=9.0"]
 test = ["pytest==9.0.3"]
 
 [project.urls]
-Repository = "https://github.com/multimodal-art-projection/YuE"
+Repository = "https://github.com/tonywestonuk/YuE-Studio"
+Upstream = "https://github.com/multimodal-art-projection/YuE"
 Demo = "https://map-yue2.github.io/"
 Models = "https://huggingface.co/m-a-p/YuE2-3B"
 
