@@ -485,7 +485,6 @@ struct ContentView: View {
     @AppStorage("randomSeed") private var randomSeed = false
     @AppStorage("batch") private var batch = 2
     @AppStorage("maxSeconds") private var maxSeconds = 120.0
-    @AppStorage("engine") private var engine = "auto"
     @AppStorage("quality") private var quality = "draft"
     @AppStorage("instrumental") private var instrumental = false
     @State private var abc = ""
@@ -524,9 +523,6 @@ struct ContentView: View {
                 if instrumental {
                     Text("Adds no-vocal tags, keeps only the section markers of the lyrics, and silences the vocal voice in the planned score before the song is tokenized. Planning is used even if set to off.").font(.caption).foregroundStyle(.secondary)
                 }
-                Picker("Synthesis engine", selection: $engine) {
-                    Text("auto").tag("auto"); Text("GPU (PyTorch)").tag("torch"); Text("GPU (MLX)").tag("mlx"); Text("Neural Engine").tag("ane")
-                }
                 HStack { Text("Max length"); Slider(value: $maxSeconds, in: 30...360, step: 10); Text("\(Int(maxSeconds)) s").monospacedDigit().frame(width: 44) }
                 HStack {
                     TextField("Base seed", value: $seed, format: .number).disabled(randomSeed)
@@ -540,7 +536,7 @@ struct ContentView: View {
                 HStack {
                     Button(action: {
                         backend.generate(style: style, lyrics: lyrics, cot: cot, seed: seed, randomSeed: randomSeed, batch: batch,
-                                         maxTokens: Int(maxSeconds * 25), engine: engine, abc: abc, quality: quality, instrumental: instrumental)
+                                         maxTokens: Int(maxSeconds * 25), engine: "auto", abc: abc, quality: quality, instrumental: instrumental)
                     }) { Label(backend.busy ? "Add to queue" : "Generate", systemImage: backend.busy ? "plus" : "play.fill").frame(maxWidth: .infinity) }
                         .buttonStyle(.borderedProminent).keyboardShortcut(.return, modifiers: .command).disabled(!backend.connected)
                     Button(action: { backend.stop() }) { Label("Stop all", systemImage: "stop.fill") }
@@ -646,9 +642,9 @@ struct ContentView: View {
             if song.inFlight {
                 Button("Cancel") { backend.cancel(song) }.disabled(!backend.connected)
             } else if song.status == .stalled || (song.status == .failed && FileManager.default.fileExists(atPath: song.directory.appendingPathComponent("semantic.npy").path)) {
-                Button(quality == "draft" ? "Synthesize draft" : "Synthesize full") { backend.render(song, engine: engine, quality: quality) }.disabled(!backend.connected)
+                Button(quality == "draft" ? "Synthesize draft" : "Synthesize full") { backend.render(song, engine: "auto", quality: quality) }.disabled(!backend.connected)
             } else if song.quality == "draft" && song.status == .ready {
-                Button("Render full quality") { players.forget(song); backend.render(song, engine: engine, quality: "full") }.disabled(!backend.connected)
+                Button("Render full quality") { players.forget(song); backend.render(song, engine: "auto", quality: "full") }.disabled(!backend.connected)
             }
             if !song.score.isEmpty { Button("Score") { showScore = song } }
             Button("Reveal") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: song.path)]) }.disabled(song.status != .ready)
