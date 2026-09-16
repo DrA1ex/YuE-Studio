@@ -42,8 +42,9 @@ LAST_ACTIVE = [time.time()]
 PHYSICAL_GIB = float(os.environ.get("YUE2_PHYSICAL_GIB") or os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30)
 CONCURRENT = os.environ.get("YUE2_PIPELINE", "1" if PHYSICAL_GIB >= 24 else "0") != "0"   # overlap the resources
 MAX_BATCH = int(os.environ.get("YUE2_MAX_BATCH", 4 if PHYSICAL_GIB >= 24 else 2))          # songs per token batch
-# Token engine: "mlx" streams 8-bit weights (2.2 GB, ~1.8x faster steps) and keeps them resident
-# beside the PyTorch copy the synthesis prefill still needs; "torch" is the original path.
+# Token engine: "mlx" streams 8-bit weights (2.3 GB, ~1.8x faster steps), quantized in about a
+# second before each batch and dropped after it, since the PyTorch copy the synthesis prefill
+# needs stays resident anyway; "torch" is the original path.
 AR_ENGINE = os.environ.get("YUE2_AR_ENGINE", "mlx" if PHYSICAL_GIB >= 24 else "torch")
 ANE_MAX_FRAMES = 12288    # MIL v7 compiles up to here (9216 x 14336 verified); 12288 x 14336 is refused, and a
                           # refused compile fails within seconds and falls back to the GPU
@@ -113,6 +114,31 @@ def generate_tokens(model, *args, **kwargs):
         return ar_mlx.generate_tokens_batched(model, *args, **kwargs)
     from yue2.batched import generate_tokens_batched
     return generate_tokens_batched(model, *args, **kwargs)
+
+
+def trim_gpu_memory(model, why):
+    """Drop GPU-side copies nothing is using right now (they come back in seconds when needed):
+    the 8-bit token weights between batches, the MLX synthesis weights when no song is on the
+    GPU lane, and MLX's buffer cache. Keeps the worker's footprint from squeezing the Neural
+    Engine's mapped memory, whose evaluate fails under memory pressure."""
+    import gc
+    with SCHED.cv:
+        gpu_synth_needed = SCHED.gpu_synth is not None or any(
+            s.state == SYNTH_WAIT and (not s.wants_ane or SCHED.ane_synth is not None) for s in SCHED.songs)
+        batch_running = SCHED.token_batch is not None
+    freed = []
+    if not batch_running and getattr(model, "_yue2_ar_mlx", None) is not None:
+        model._yue2_ar_mlx = None; freed.append("token weights")
+    if not gpu_synth_needed and getattr(model, "_yue2_mlx_weights", None) is not None:
+        model._yue2_mlx_weights = None; freed.append("synthesis weights")
+    gc.collect()
+    try:
+        import mlx.core as mx
+        (getattr(mx, "clear_cache", None) or mx.metal.clear_cache)()
+    except Exception:
+        pass
+    if freed:
+        log(f"Freed MLX {' and '.join(freed)} ({why})")
 
 
 def acquire_model():
@@ -504,6 +530,10 @@ def run_batch(batch):
     finally:
         with SCHED.cv:
             SCHED.token_batch = None
+        try:
+            trim_gpu_memory(model, "batch finished")
+        except Exception:
+            pass
         SCHED.tick()
 
 
@@ -657,6 +687,7 @@ def run_gpu(song):
             with SCHED.cv:
                 if SCHED.gpu_synth is song:
                     SCHED.gpu_synth = None                   # the GPU is free for the next song
+            trim_gpu_memory(model, "moved to the Neural Engine")
             SCHED.tick()
         latents, used, switched_at = synthesize_switchable(model, song.plan.prefix, song.codec, song.seed,
                                                            may_switch=(lambda: song.migrate) if movable else None,
@@ -671,6 +702,7 @@ def run_gpu(song):
                 SCHED.gpu_synth = None
             if SCHED.ane_synth is song:
                 SCHED.ane_synth = None
+        trim_gpu_memory(model, "GPU synthesis finished")
         if song.cancel.is_set():
             SCHED.finish(song, CANCELLED, "stopped"); return
         song.set_state(RENDER_WAIT, "waiting", engine=song.used_engine)
@@ -835,8 +867,7 @@ def release(deep=False):
     if PIPE is not None and PIPE._model is not None:
         model = PIPE._model
         model._yue2_mlx_weights = None
-        if deep:
-            model._yue2_ar_mlx = None            # the 8-bit token weights stay across jobs (re-quantizing takes seconds)
+        model._yue2_ar_mlx = None
         programs = getattr(model, "_yue2_ane_programs", None)
         if programs is not None:                 # unmap programs before freeing the surfaces they bind
             with programs.lock:

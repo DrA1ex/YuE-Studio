@@ -218,8 +218,13 @@ token and a 0.9996 logit correlation; greedy decoding diverges from PyTorch at
 the same point as the unquantized MLX port does, so the drift is bf16
 accumulation order, not the quantization. The worker uses it by default on
 machines with 24 GB or more (`YUE2_AR_ENGINE=torch` restores the PyTorch loop);
-the PyTorch copy of the AR weights stays for the synthesis prefill, so the two
-copies cost 6.2 GB together, which is why 16 GB machines keep the PyTorch loop.
+the 8-bit copy is quantized before each batch (about a second) and dropped
+after it, and the MLX synthesis weights are dropped whenever no song needs the
+GPU for synthesis (`trim_gpu_memory`): with the PyTorch weights, the Neural
+Engine surfaces and a long song's activations all resident, the worker
+otherwise peaked at 26 GB on the 32 GB machine, and the Neural Engine's
+evaluate fails when its mapped memory is squeezed. 16 GB machines keep the
+PyTorch loop.
 `tools/bench_ar_mlx.py` reproduces the comparison.
 
 **The scheduler.** `tools/yue2_worker.py` treats songs as processes and the
