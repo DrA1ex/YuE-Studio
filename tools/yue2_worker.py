@@ -42,6 +42,9 @@ LAST_ACTIVE = [time.time()]
 PHYSICAL_GIB = float(os.environ.get("YUE2_PHYSICAL_GIB") or os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30)
 CONCURRENT = os.environ.get("YUE2_PIPELINE", "1" if PHYSICAL_GIB >= 24 else "0") != "0"   # overlap the resources
 MAX_BATCH = int(os.environ.get("YUE2_MAX_BATCH", 4 if PHYSICAL_GIB >= 24 else 2))          # songs per token batch
+# Token engine: "mlx" streams 8-bit weights (2.2 GB, ~1.8x faster steps) and keeps them resident
+# beside the PyTorch copy the synthesis prefill still needs; "torch" is the original path.
+AR_ENGINE = os.environ.get("YUE2_AR_ENGINE", "mlx" if PHYSICAL_GIB >= 24 else "torch")
 ANE_MAX_FRAMES = 12288    # MIL v7 compiles up to here (9216 x 14336 verified); 12288 x 14336 is refused, and a
                           # refused compile fails within seconds and falls back to the GPU
 # PyTorch's Metal backend encodes every thread into one command buffer, so all PyTorch GPU work
@@ -78,7 +81,8 @@ def pipeline():
         PIPE = YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device=device, progress=False, lean=lean,
                                             vae_core_frames=1024 if PHYSICAL_GIB >= 24 else 512)
         log(f"Physical memory {PHYSICAL_GIB:.0f} GB: {'lean' if lean else 'full'} model, VAE tile {PIPE.vae_core_frames} frames, "
-            f"token batches of up to {MAX_BATCH}, resources {'overlap' if CONCURRENT else 'take turns'}")
+            f"token batches of up to {MAX_BATCH} on {'MLX with 8-bit weights' if token_engine() == 'mlx' else 'PyTorch'}, "
+            f"resources {'overlap' if CONCURRENT else 'take turns'}")
         PIPE._load_model()
         log(f"Model ready in {time.perf_counter() - t0:.0f} s")
     elif PIPE._model is None:                        # dropped while idle
@@ -86,6 +90,29 @@ def pipeline():
         PIPE._load_model()
         log(f"Model reloaded in {time.perf_counter() - t0:.0f} s")
     return PIPE
+
+
+def token_engine():
+    if AR_ENGINE == "mlx":
+        try:
+            import mlx.core  # noqa: F401
+            return "mlx"
+        except ImportError:
+            return "torch"
+    return "torch"
+
+
+def generate_tokens(model, *args, **kwargs):
+    """The batched token decoder on the configured engine (same interface either way)."""
+    if token_engine() == "mlx":
+        from yue2 import ar_mlx
+        if getattr(model, "_yue2_ar_mlx", None) is None:
+            t0 = time.perf_counter()
+            ar_mlx.weights_for(model)
+            log(f"Token weights quantized to 8 bits for MLX in {time.perf_counter() - t0:.0f} s ({model._yue2_ar_mlx.bytes() / 1e9:.1f} GB)")
+        return ar_mlx.generate_tokens_batched(model, *args, **kwargs)
+    from yue2.batched import generate_tokens_batched
+    return generate_tokens_batched(model, *args, **kwargs)
 
 
 def acquire_model():
@@ -367,7 +394,6 @@ def save_tokens(song):
 def run_batch(batch):
     """Plan (if needed) and tokenize a batch of songs together on the GPU."""
     import dataclasses
-    from yue2.batched import generate_tokens_batched
     from yue2.pipeline import SymbolicPlan
     from yue2.protocol import CODEC_OFFSET, token_prefixes
     songs = list(batch)
@@ -420,7 +446,7 @@ def run_batch(batch):
             for s in songs:
                 s.set_state(PLANNING, "planning the score")
             prefixes = [token_prefixes(r, tokenizer) for r in requests]
-            rows, timing = generate_tokens_batched(model, prefixes, pipe.generation_config.abc, [s.seed for s in songs], "abc",
+            rows, timing = generate_tokens(model, prefixes, pipe.generation_config.abc, [s.seed for s in songs], "abc",
                                                    cancelled=cancelled, on_token=reporter("abc", 900, max(len(p) for p in prefixes)),
                                                    lock=TORCH_LOCK)
             plans = [SymbolicPlan(r, tokenizer.decode(ids), ids, token_prefixes(r, tokenizer, ids), t, trunc)
@@ -457,7 +483,7 @@ def run_batch(batch):
             if i not in released:
                 release_song(i, tokens, t, bool(t.get("truncated", False)))
 
-        rows, timing = generate_tokens_batched(model, [p.prefix for p in plans], sampling, [s.seed for s in songs], "semantic",
+        rows, timing = generate_tokens(model, [p.prefix for p in plans], sampling, [s.seed for s in songs], "semantic",
                                                legacy_off=(songs[0].mode == "off"), cancelled=cancelled,
                                                on_token=reporter("semantic", max(limits), max(len(p.prefix) for p in plans)),
                                                lock=TORCH_LOCK, on_row_done=on_row_done, limits=limits)
@@ -809,6 +835,8 @@ def release(deep=False):
     if PIPE is not None and PIPE._model is not None:
         model = PIPE._model
         model._yue2_mlx_weights = None
+        if deep:
+            model._yue2_ar_mlx = None            # the 8-bit token weights stay across jobs (re-quantizing takes seconds)
         programs = getattr(model, "_yue2_ane_programs", None)
         if programs is not None:                 # unmap programs before freeing the surfaces they bind
             with programs.lock:

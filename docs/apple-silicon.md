@@ -208,6 +208,20 @@ falls back to MLX on a refusal. Accuracy is unchanged (velocity 0.9997 on the
 20 s song, 0.9995 on the 4-minute song; latents 0.9999); the batch-axis layout
 roughly doubles the op count, so the 4-minute bucket compiles in ~47 s.
 
+**8-bit token decoding in MLX.** The token loop is bound by the bytes of
+weights it streams per step (4.04 GB in bf16 at about 109 GB/s: 37 ms), so
+`src/yue2/ar_mlx.py` runs it in MLX with the AR weights stored as 8-bit integers
+plus a 16-bit scale and bias per group of 64 (2.2 GB), expanded inside MLX's
+quantized matmul. Measured on the M4: 18.5 ms per step against 33 to 37 for
+PyTorch, a 1.8x speedup at batch sizes 1, 2 and 4, with the same top-1 first
+token and a 0.9996 logit correlation; greedy decoding diverges from PyTorch at
+the same point as the unquantized MLX port does, so the drift is bf16
+accumulation order, not the quantization. The worker uses it by default on
+machines with 24 GB or more (`YUE2_AR_ENGINE=torch` restores the PyTorch loop);
+the PyTorch copy of the AR weights stays for the synthesis prefill, so the two
+copies cost 6.2 GB together, which is why 16 GB machines keep the PyTorch loop.
+`tools/bench_ar_mlx.py` reproduces the comparison.
+
 **The scheduler.** `tools/yue2_worker.py` treats songs as processes and the
 GPU and the Neural Engine as resources. Each song has a priority (its arrival
 number) and a state: queued, planning, tokenizing, waiting for synthesis,
