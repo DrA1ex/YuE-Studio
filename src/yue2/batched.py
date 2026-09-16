@@ -207,7 +207,7 @@ def sample_batched(logits, sampling, histories, step, phase, generators, legacy_
 
 @torch.inference_mode()
 def generate_tokens_batched(model, prefixes, sampling, seeds, phase, *, legacy_off=False,
-                            cancelled=None, on_token=None, pad_id=0, lock=None, on_row_done=None):
+                            cancelled=None, on_token=None, pad_id=0, lock=None, on_row_done=None, limits=None):
     """Decode ``len(prefixes)`` sequences in one batch.
 
     Returns ``(rows, batch_timing)``; ``rows[i] = (tokens, timing, truncated)``
@@ -217,7 +217,9 @@ def generate_tokens_batched(model, prefixes, sampling, seeds, phase, *, legacy_o
     other threads can use the same PyTorch device between steps. ``on_row_done``
     is called as ``on_row_done(row, tokens, timing)`` the moment a row emits its
     end token, while the batch continues for the other rows, so a finished
-    sequence can move on without waiting for the longest one.
+    sequence can move on without waiting for the longest one. ``limits`` gives a
+    per-row token budget (at most ``sampling.max_tokens``): a row that reaches
+    its own budget stops, truncated, while the batch continues.
     """
     n = len(prefixes)
     if n < 1 or len(seeds) != n:
@@ -231,6 +233,8 @@ def generate_tokens_batched(model, prefixes, sampling, seeds, phase, *, legacy_o
     longest = max(lengths)
     if longest + sampling.max_tokens > CONTEXT:
         raise ValueError("Longest prefix + generation budget exceeds 24576")
+    if limits is not None and (len(limits) != n or any(l < 1 or l > sampling.max_tokens for l in limits)):
+        raise ValueError("limits must give each row a budget between 1 and sampling.max_tokens")
     end = ABC_END if phase == "abc" else MUSIC_END
 
     ids = torch.full((n, longest), pad_id, dtype=torch.long)
@@ -252,11 +256,11 @@ def generate_tokens_batched(model, prefixes, sampling, seeds, phase, *, legacy_o
 
     with sliced_lm_head(model, phase):
         return _run(model, cache, ids, allowed, positions, real, prefixes, lengths, sampling, seeds,
-                    phase, end, legacy_off, cancelled, on_token, device, lock, on_row_done)
+                    phase, end, legacy_off, cancelled, on_token, device, lock, on_row_done, limits)
 
 
 def _run(model, cache, ids, allowed, positions, real, prefixes, lengths, sampling, seeds,
-         phase, end, legacy_off, cancelled, on_token, device, lock=None, on_row_done=None):
+         phase, end, legacy_off, cancelled, on_token, device, lock=None, on_row_done=None, limits=None):
     from contextlib import nullcontext
     lock = nullcontext() if lock is None else lock
     n = len(prefixes)
@@ -304,6 +308,15 @@ def _run(model, cache, ids, allowed, positions, real, prefixes, lengths, samplin
                             "execution": "eager_batched", "batch_size": n, "batch_index": i})
                 else:
                     histories[i].append(token)
+                    if limits is not None and len(histories[i]) >= limits[i]:
+                        done[i] = True                       # own budget reached: truncated, batch continues
+                        if on_row_done is not None:
+                            elapsed = time.perf_counter() - start
+                            on_row_done(i, list(histories[i]), {
+                                "seconds": elapsed, "prefill_seconds": prefill_seconds, "ttft_seconds": first[i],
+                                "output_tokens": len(histories[i]), "content_tokens": len(histories[i]),
+                                "output_tps": len(histories[i]) / elapsed, "prefix_tokens": lengths[i], "cfg_branches": 1,
+                                "execution": "eager_batched", "batch_size": n, "batch_index": i, "truncated": True})
             steps = step + 1
             if all(done) or step + 1 >= sampling.max_tokens:
                 break

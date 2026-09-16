@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
 """Long-lived YuE2 worker for native front ends: JSON lines in on stdin, JSON events out on stdout.
 
-Every request joins a queue and flows through three independent stages, each on its own thread:
+Songs are processes, the GPU and the Neural Engine are resources, and one scheduler assigns
+resources to songs by priority (the order the songs were added). See ``Scheduler.schedule`` for
+the whole policy; in short:
 
-    queue -> tokens (GPU: score + song tokens, all songs of a job in one batch)
-          -> synthesis (Neural Engine at full quality; GPU/MLX for drafts, and for a full-quality song
-                        that would otherwise wait while the GPU is idle: it moves to the Neural Engine mid-solve)
-          -> decode (GPU: VAE to waveform, files written)
-
-The stages overlap: the GPU generates the next job's tokens while the Neural Engine synthesizes
-this one, and finished latents are decoded as soon as they arrive. Machines under 24 GB run the
-stages one at a time (YUE2_PIPELINE=1 forces overlap, =0 forces one at a time).
+  Neural Engine   the highest-priority song that wants it, including a song already solving on
+                  the GPU, which moves across mid-solve if it outranks everything waiting.
+  GPU, tokenizing the highest-priority queued song, taking every other queued song of the same
+                  kind along in one batch (one row or four cost the same per step).
+  GPU, synthesis  drafts, and full-quality songs while the Neural Engine is busy. A queued song
+                  that outranks the song synthesizing on the GPU starts its batch and the
+                  synthesis pauses between steps until the GPU is free again.
+  Rendering       always admitted: its tiles interleave with token steps.
 
 Requests: {"cmd": "generate", "style", "lyrics", "cot": "full|melody|off", "seed", "random_seed", "batch",
-           "max_tokens", "engine": "auto|torch|mlx|ane", "abc": str|null, "quality": "draft|full", "draft_steps",
-           "instrumental": bool}   (instrumental: no-vocal tags, marker-only lyrics, vocal voice silenced in the planned score)
-          {"cmd": "render", "path": song directory or its audio.flac, "engine", "quality": "full|draft"}
+           "max_tokens", "abc": str|null, "quality": "draft|full", "draft_steps", "instrumental": bool}
+          {"cmd": "render", "path": song directory or its audio.flac, "quality": "full|draft"}
           {"cmd": "cancel", "path"}   {"cmd": "stop"}   {"cmd": "ping"}   {"cmd": "quit"}
 Events:   {"event": "ready"}   {"event": "log", "message"}   {"event": "pong"}   {"event": "error", "message"}
-          {"event": "started", "job", "output", "songs": [{"index", "seed", "path"}]}     (songs are queued)
-          {"event": "stage", "path", "stage": "queued|planning|tokens|synth|decode|ready|failed|cancelled", "detail", "engine"}
-          {"event": "progress", "path", "fraction": 0-1, "detail", "gflops": rate}   (gflops: rough throughput, GFLOP/s)
+          {"event": "started", "job", "output", "songs": [{"index", "seed", "path", "priority"}]}
+          {"event": "stage", "path", "priority", "stage": "queued|planning|tokens|synth|decode|ready|failed|cancelled",
+           "detail", "engine"}
+          {"event": "progress", "path", "fraction": 0-1, "detail", "gflops": rate}
           {"event": "song", "index", "path", "score", "seconds", "seed", "truncated", "quality", "steps", "engine"}
-          {"event": "failed", "path", "message"}   {"event": "idle"}   (every queued song finished or was cancelled)
+          {"event": "failed", "path", "message"}   {"event": "idle"}   (every song finished or was cancelled)
 """
-import collections, datetime as dt, json, os, sys, threading, time, traceback
+import datetime as dt, itertools, json, os, sys, threading, time, traceback
 from pathlib import Path
 os.environ.setdefault("TQDM_DISABLE", "1")          # coremltools progress bars would otherwise flood the app log
 import warnings
@@ -35,18 +37,18 @@ OUTPUT_DIR = Path(os.environ.get("YUE2_OUTPUT_DIR", ROOT / "outputs" / "app"))
 PIPE = None
 LOCK = threading.Lock()                              # stdout
 MODEL_LOCK = threading.Lock()                        # model load/unload and memory release
+IDLE_UNLOAD_S = float(os.environ.get("YUE2_IDLE_UNLOAD_S", 600))   # drop the model after this long idle (reloads in ~1 s)
+LAST_ACTIVE = [time.time()]
+PHYSICAL_GIB = float(os.environ.get("YUE2_PHYSICAL_GIB") or os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30)
+CONCURRENT = os.environ.get("YUE2_PIPELINE", "1" if PHYSICAL_GIB >= 24 else "0") != "0"   # overlap the resources
+MAX_BATCH = int(os.environ.get("YUE2_MAX_BATCH", 4 if PHYSICAL_GIB >= 24 else 2))          # songs per token batch
+ANE_MAX_FRAMES = 12288    # MIL v7 compiles up to here (9216 x 14336 verified); 12288 x 14336 is refused, and a
+                          # refused compile fails within seconds and falls back to the GPU
 # PyTorch's Metal backend encodes every thread into one command buffer, so all PyTorch GPU work
 # (token steps, the synthesis prefill, decode tiles) takes turns on this lock; the Neural Engine
 # and MLX solvers run outside it, which is what lets synthesis overlap token generation.
 from yue2.locks import FairLock
 TORCH_LOCK = FairLock()
-IDLE_UNLOAD_S = float(os.environ.get("YUE2_IDLE_UNLOAD_S", 600))   # drop the model after this long idle (reloads in ~1 s)
-LAST_ACTIVE = [time.time()]
-PHYSICAL_GIB = float(os.environ.get("YUE2_PHYSICAL_GIB") or os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30)
-CONCURRENT = os.environ.get("YUE2_PIPELINE", "1" if PHYSICAL_GIB >= 24 else "0") != "0"
-STAGE_LOCK = threading.Lock() if not CONCURRENT else None          # one stage at a time on small machines
-ANE_MAX_FRAMES = 12288    # MIL v7 compiles up to here (9216 x 14336 verified); 12288 x 14336 is refused, and a
-                          # refused compile fails within seconds and falls back to MLX (synthesize_item)
 
 
 def emit(**event):
@@ -76,7 +78,7 @@ def pipeline():
         PIPE = YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device=device, progress=False, lean=lean,
                                             vae_core_frames=1024 if PHYSICAL_GIB >= 24 else 512)
         log(f"Physical memory {PHYSICAL_GIB:.0f} GB: {'lean' if lean else 'full'} model, VAE tile {PIPE.vae_core_frames} frames, "
-            f"stages {'overlap' if CONCURRENT else 'run one at a time'}")
+            f"token batches of up to {MAX_BATCH}, resources {'overlap' if CONCURRENT else 'take turns'}")
         PIPE._load_model()
         log(f"Model ready in {time.perf_counter() - t0:.0f} s")
     elif PIPE._model is None:                        # dropped while idle
@@ -86,49 +88,21 @@ def pipeline():
     return PIPE
 
 
-def choose_engine(engine, pipe, n_frames, quality):
-    """Resolve the engine for one song. Drafts always use MLX (no compile); "auto" uses the Neural
-    Engine only for songs its compiler accepts and falls back to MLX beyond that."""
+def acquire_model():
+    with MODEL_LOCK:
+        LAST_ACTIVE[0] = time.time()
+        pipe = pipeline()
+        return pipe, pipe._load_model()
+
+
+def ane_available():
     from yue2.ane import runtime as ane_runtime
-    from yue2 import nar_mlx
-    if engine == "torch" and pipe.lean:
-        engine = "auto"
-    if quality == "draft":
-        return "mlx" if nar_mlx.available() else "torch"
-    S = ane_runtime.bucket(n_frames + 2, ane_runtime.S_STEP)
-    if engine in ("auto", "ane"):
-        if ane_runtime.available() and S <= ANE_MAX_FRAMES:
-            return "ane"
-        return "mlx" if nar_mlx.available() else "torch"
-    return engine
+    return ane_runtime.available()
 
 
-# ── Pipeline state ───────────────────────────────────────────────────────────
-
-class Item:
-    """One song on its way through the stages."""
-
-    def __init__(self, job, index, seed, request, directory, quality, steps, engine):
-        self.job, self.index, self.seed, self.request = job, index, seed, request
-        self.directory = Path(directory)
-        self.path = str(self.directory / "audio.flac")
-        self.quality, self.steps, self.engine = quality, steps, engine
-        self.cancel = threading.Event()
-        self.stage = "queued"
-        self.plan = None; self.codec = None; self.semantic_timing = {}; self.truncated = False
-        self.latents = None; self.used_engine = None; self.nar_seconds = 0.0
-
-    @property
-    def label(self):
-        return f"{self.directory.parent.name}/{self.directory.name}"
-
-    def set_stage(self, stage, detail="", **extra):
-        self.stage = stage
-        emit(event="stage", path=self.path, stage=stage, detail=detail, **extra)
-
-    def progress(self, fraction, detail="", gflops=None):
-        extra = {} if gflops is None else {"gflops": round(gflops, 1)}
-        emit(event="progress", path=self.path, fraction=max(0.0, min(1.0, fraction)), detail=detail, **extra)
+def ane_can_take(n_frames):
+    from yue2.ane import runtime as ane_runtime
+    return ane_available() and ane_runtime.bucket(n_frames + 2, ane_runtime.S_STEP) <= ANE_MAX_FRAMES
 
 
 # ── Throughput estimates (rough, for the status line) ────────────────────────
@@ -172,81 +146,100 @@ class Rate:
         return self.value
 
 
-class Job:
-    """One generate request: its songs share a batch in the tokens stage."""
+# ── Processes ────────────────────────────────────────────────────────────────
 
-    def __init__(self, id, req, items):
-        self.id, self.req, self.items = id, req, items
+QUEUED, PLANNING, TOKENIZING, SYNTH_WAIT, SYNTHING, RENDER_WAIT, RENDERING, DONE, FAILED, CANCELLED = (
+    "queued", "planning", "tokenizing", "synth_wait", "synthing", "render_wait", "rendering", "done", "failed", "cancelled")
+UI_STAGE = {QUEUED: "queued", PLANNING: "planning", TOKENIZING: "tokens", SYNTH_WAIT: "synth", SYNTHING: "synth",
+            RENDER_WAIT: "decode", RENDERING: "decode", DONE: "ready", FAILED: "failed", CANCELLED: "cancelled"}
 
 
-class Channel:
-    """FIFO between stages; cancelled entries are skipped and can be removed while queued."""
+class Song:
+    """One song on its way through the stages: a process with a priority (its arrival number)."""
+    _sequence = itertools.count(1)
+
+    def __init__(self, run, index, seed, request, directory, quality, steps, limit, instrumental=False):
+        self.priority = next(Song._sequence)
+        self.run, self.index, self.seed, self.request = run, index, seed, request
+        self.directory = Path(directory)
+        self.path = str(self.directory / "audio.flac")
+        self.quality, self.steps, self.limit, self.instrumental = quality, steps, limit, instrumental
+        self.mode = request.cot
+        self.needs_plan = request.cot != "off" and request.abc is None
+        self.cancel = threading.Event()
+        self.state = QUEUED
+        self.plan = None; self.codec = None; self.timing = {}; self.truncated = False
+        self.latents = None; self.used_engine = None; self.nar_seconds = 0.0
+        self.wants_ane = False                    # decided once the song's length is known
+        self.program_ready = threading.Event()    # its Neural Engine program is compiled
+        self.program_failed = False
+        self.migrate = False                      # the scheduler granted it the Neural Engine mid-solve
+        self.migrated = False
+
+    @property
+    def label(self):
+        return f"{self.directory.parent.name}/{self.directory.name}"
+
+    @property
+    def frames(self):
+        return len(self.codec) if self.codec is not None else 0
+
+    def set_state(self, state, detail="", **extra):
+        self.state = state
+        emit(event="stage", path=self.path, priority=self.priority, stage=UI_STAGE[state], detail=detail, **extra)
+
+    def progress(self, fraction, detail="", gflops=None):
+        extra = {} if gflops is None else {"gflops": round(gflops, 1)}
+        emit(event="progress", path=self.path, fraction=max(0.0, min(1.0, fraction)), detail=detail, **extra)
+
+    def decide_engine(self):
+        """Full-quality songs go to the Neural Engine when its compiler accepts their length."""
+        self.wants_ane = self.quality == "full" and ane_can_take(self.frames)
+
+
+# ── Scheduler ────────────────────────────────────────────────────────────────
+
+class Scheduler:
+    """Assigns the GPU and the Neural Engine to songs by priority. Every event (a song arrives, a
+    stage ends, a resource frees) calls ``tick``; ``schedule`` holds the entire policy."""
 
     def __init__(self):
-        self.items = collections.deque()
         self.cv = threading.Condition()
+        self.songs = []                           # live processes, any state before done/failed/cancelled
+        self.token_batch = None                   # songs tokenizing together on the GPU
+        self.gpu_synth = None                     # song synthesizing on the GPU
+        self.ane_synth = None                     # song on the Neural Engine (or granted it)
+        self.render = None                        # song rendering on the GPU
+        self.ane_prefill = False                  # the Neural Engine song is briefly on the GPU (prefill)
 
-    def put(self, item):
+    # -- bookkeeping ---------------------------------------------------------
+    def submit(self, songs):
         with self.cv:
-            self.items.append(item); self.cv.notify()
+            self.songs.extend(songs)
+        for s in songs:
+            s.set_state(s.state, "waiting for the GPU" if s.state == QUEUED else "waiting")
+        self.tick()
 
-    def get(self):
+    def finish(self, song, state, detail="", **extra):
         with self.cv:
-            while not self.items:
-                self.cv.wait()
-            return self.items.popleft()
-
-    def take(self, pred, on_take=None):
-        """The first queued item satisfying ``pred`` (re-checked every second, since predicates may
-        depend on lane state); ``on_take`` runs under the lock once it is chosen."""
-        with self.cv:
-            while True:
-                for item in self.items:
-                    if pred(item):
-                        self.items.remove(item)
-                        if on_take is not None:
-                            on_take()
-                        return item
-                self.cv.wait(1.0)
-
-    def remove(self, item):
-        with self.cv:
-            try:
-                self.items.remove(item); return True
-            except ValueError:
-                return False
-
-    def snapshot(self):
-        with self.cv:
-            return list(self.items)
-
-
-class Pipeline:
-    def __init__(self):
-        self.jobs, self.synth, self.decode = Channel(), Channel(), Channel()
-        self.live = {}                               # path -> Item, from queueing until ready/failed/cancelled
-        self.lock = threading.Lock()
-
-    def add(self, items):
-        with self.lock:
-            for item in items:
-                self.live[item.path] = item
-
-    def finish(self, item, stage, detail="", **extra):
-        """Take an item out of the pipeline (ready, failed or cancelled) and release memory when it was the last."""
-        with self.lock:
-            if self.live.pop(item.path, None) is None:
-                return                                   # already out (cancelled twice)
-            empty = not self.live
-        item.set_stage(stage, detail, **extra)
+            if song not in self.songs:
+                return
+            self.songs.remove(song)
+            for slot in ("gpu_synth", "ane_synth", "render"):
+                if getattr(self, slot) is song:
+                    setattr(self, slot, None)
+            empty = not self.songs
+        song.set_state(state, detail, **extra)
         if empty:
             self.drained()
+        else:
+            self.tick()
 
     def drained(self):
         LAST_ACTIVE[0] = time.time()
         with MODEL_LOCK:
-            with self.lock:
-                if self.live:                        # new work arrived meanwhile
+            with self.cv:
+                if self.songs:
                     return
             try:
                 with TORCH_LOCK:
@@ -255,461 +248,458 @@ class Pipeline:
                 log(f"Memory release failed: {exc}")
         emit(event="idle")
 
-    def cancel(self, item, reason="cancelled"):
-        item.cancel.set()
-        if self.synth.remove(item) or self.decode.remove(item):
-            self.finish(item, "cancelled", reason); return           # was waiting between stages: gone at once
-        job = item.job
-        if job is not None and job in self.jobs.snapshot():
-            if all(it.cancel.is_set() for it in job.items):
-                self.jobs.remove(job)
-            self.finish(item, "cancelled", reason); return           # queued job: siblings keep their place
-        log(f"Cancelling {item.label} ({item.stage})")              # running: the stage drops it at its next check
+    def cancel(self, song, reason="cancelled"):
+        song.cancel.set()
+        if song.state in (QUEUED, SYNTH_WAIT, RENDER_WAIT):
+            self.finish(song, CANCELLED, reason)         # waiting: gone at once
+        else:
+            log(f"Cancelling {song.label} ({song.state})")   # running: its thread drops it at the next check
 
     def stop(self):
-        with self.lock:
-            items = list(self.live.values())
-        log(f"Stop requested: cancelling {len(items)} song(s)")
-        for item in items:
-            self.cancel(item, "stopped")
+        with self.cv:
+            songs = sorted(self.songs, key=lambda s: s.priority)
+        log(f"Stop requested: cancelling {len(songs)} song(s)")
+        for s in songs:
+            self.cancel(s, "stopped")
+
+    def find(self, path):
+        with self.cv:
+            for s in self.songs:
+                if s.path == path or str(s.directory) == path:
+                    return s
+        return None
+
+    def tick(self):
+        with self.cv:
+            starts = self.schedule()
+        for target, arg in starts:
+            threading.Thread(target=target, args=(arg,), daemon=True).start()
+
+    # -- the policy ------------------------------------------------------------
+    def schedule(self):
+        """Decide what starts now. Returns the worker functions to run in threads."""
+        live = sorted(self.songs, key=lambda s: s.priority)
+        def first(state, ok=lambda s: True):
+            return next((s for s in live if s.state == state and not s.cancel.is_set() and ok(s)), None)
+        running = any(x is not None for x in (self.token_batch, self.gpu_synth, self.ane_synth, self.render))
+        starts = []
+
+        # Neural Engine: the highest-priority song that wants it, whether waiting or already on the GPU.
+        if self.ane_synth is None and (CONCURRENT or not running):
+            waiting = first(SYNTH_WAIT, lambda s: s.wants_ane)
+            g = self.gpu_synth
+            movable = g if (g is not None and g.wants_ane and g.program_ready.is_set() and not g.migrate and not g.cancel.is_set()) else None
+            best = min((s for s in (waiting, movable) if s is not None), key=lambda s: s.priority, default=None)
+            if best is not None and best is movable:
+                best.migrate = True; self.ane_synth = best          # picked up at its next step boundary
+            elif best is not None:
+                self.ane_synth = best; best.state = SYNTHING
+                starts.append((run_ane, best))
+                running = True
+
+        # Rendering: always admitted (tiles interleave with token steps; a GPU synthesis pauses for it).
+        if self.render is None and (CONCURRENT or not running):
+            s = first(RENDER_WAIT)
+            if s is not None:
+                self.render = s; s.state = RENDERING
+                starts.append((run_render, s))
+                running = True
+
+        # GPU: the highest-priority song that needs it decides between tokenizing and synthesis.
+        q = first(QUEUED)
+        cand = first(SYNTH_WAIT, lambda s: not s.wants_ane or self.ane_synth is not None) if self.gpu_synth is None else None
+        if q is not None and cand is not None and cand.priority < q.priority:
+            q = None                                            # the synthesis candidate outranks the queue
+        # Tokenizing: the top queued song and every queued song of the same kind with it. It also
+        # starts over a lower-priority GPU synthesis, which then pauses (preemption).
+        if q is not None and self.token_batch is None and (CONCURRENT or not running) \
+                and (self.gpu_synth is None or q.priority < self.gpu_synth.priority):
+            batch = [s for s in live if s.state == QUEUED and not s.cancel.is_set()
+                     and s.mode == q.mode and s.needs_plan == q.needs_plan][:MAX_BATCH]
+            self.token_batch = batch
+            for s in batch:
+                s.state = PLANNING if s.needs_plan else TOKENIZING
+            starts.append((run_batch, batch))
+            running = True
+        # Synthesis on the GPU: drafts, and full-quality songs while the Neural Engine is busy (they
+        # move across when granted). Only when no batch runs and no queued song outranks it.
+        elif cand is not None and q is None and self.token_batch is None and (CONCURRENT or not running):
+            self.gpu_synth = cand; cand.state = SYNTHING
+            starts.append((run_gpu, cand))
+        return starts
+
+    def gpu_wanted_elsewhere(self):
+        """A GPU synthesis pauses while this is true (tokenizing, rendering, or the Neural Engine
+        song's prefill are on the GPU: MLX's long kernels would starve them)."""
+        return self.token_batch is not None or self.render is not None or self.ane_prefill
 
     def summary(self):
-        with self.lock:
-            return collections.Counter(it.stage for it in self.live.values())
+        with self.cv:
+            return {"queued": sum(s.state == QUEUED for s in self.songs), "live": len(self.songs)}
 
 
-PIPELINE = Pipeline()
+SCHED = Scheduler()
 
 
-# ── Stages ───────────────────────────────────────────────────────────────────
+# ── Workers (one thread each, started by the scheduler) ───────────────────────
 
-def stage_lock():
-    from contextlib import nullcontext
-    return STAGE_LOCK if STAGE_LOCK is not None else nullcontext()
-
-
-def acquire_model():
-    with MODEL_LOCK:
-        LAST_ACTIVE[0] = time.time()
-        pipe = pipeline()
-        return pipe, pipe._load_model()
+def fail(song, exc):
+    traceback.print_exc(file=sys.stderr)
+    log(f"{song.label} failed: {type(exc).__name__}: {exc}")
+    emit(event="failed", path=song.path, message=f"{type(exc).__name__}: {exc}")
+    SCHED.finish(song, FAILED, str(exc)[:200])
 
 
-def save_tokens(item):
+def save_tokens(song):
     """Persist the plan and song tokens as soon as they exist, so a song can be synthesized later
     (render command) even if the worker stops before its audio is written."""
     import numpy as np
     from yue2.storage import write_json
-    item.directory.mkdir(parents=True, exist_ok=True)
-    item.plan.save(item.directory)
-    np.save(item.directory / "semantic.npy", np.asarray(item.codec, dtype=np.int32))
-    write_json(item.directory / "request.json", item.request.to_dict())
-    write_json(item.directory / "tokens.json", {"seed": item.seed, "frames": len(item.codec), "quality": item.quality,
-                                               "steps": item.steps, "engine": item.engine, "truncated": bool(item.truncated),
-                                               "timing": item.semantic_timing})
+    song.directory.mkdir(parents=True, exist_ok=True)
+    song.plan.save(song.directory)
+    np.save(song.directory / "semantic.npy", np.asarray(song.codec, dtype=np.int32))
+    write_json(song.directory / "request.json", song.request.to_dict())
+    write_json(song.directory / "tokens.json", {"seed": song.seed, "frames": len(song.codec), "quality": song.quality,
+                                               "steps": song.steps, "priority": song.priority, "truncated": bool(song.truncated),
+                                               "timing": song.timing})
 
 
-def tokens_stage():
-    while True:
-        job = PIPELINE.jobs.get()
-        items = [it for it in job.items if not it.cancel.is_set()]
-        if not items:
-            continue
-        with stage_lock():
-            set_lane(tokens=True)
-            try:
-                run_tokens(job, items)
-            except InterruptedError:
-                for it in items:
-                    PIPELINE.finish(it, "cancelled", "stopped")
-            except Exception as exc:
-                traceback.print_exc(file=sys.stderr)
-                log(f"Token generation failed for {job.id}: {type(exc).__name__}: {exc}")
-                for it in items:
-                    emit(event="failed", path=it.path, message=f"{type(exc).__name__}: {exc}")
-                    PIPELINE.finish(it, "failed", str(exc)[:200])
-            finally:
-                set_lane(tokens=False)
-
-
-def run_tokens(job, items):
+def run_batch(batch):
+    """Plan (if needed) and tokenize a batch of songs together on the GPU."""
     import dataclasses
     from yue2.batched import generate_tokens_batched
     from yue2.pipeline import SymbolicPlan
     from yue2.protocol import CODEC_OFFSET, token_prefixes
-    req = job.req
-    pipe, model = acquire_model()
-    tokenizer = pipe.tokenizer
-    n = len(items); mode = req.get("cot", "full"); engine = req.get("engine", "auto")
-    if engine == "torch" and pipe.lean:
-        log("The PyTorch synthesis engine needs the full model; using the automatic engine instead")
-        engine = "auto"
-    abc = (req.get("abc") or "").strip() or None
-    cancelled = lambda: all(it.cancel.is_set() for it in items)
-    log(f"Tokens: {job.id}, {n} song(s), mode {mode}, seeds {[it.seed for it in items]}")
-    max_tokens = min(int(req.get("max_tokens", 9000)), 9000)
+    songs = list(batch)
+    try:
+        pipe, model = acquire_model()
+        # The GPU is ours now: take along any songs of the same kind that queued meanwhile (a job
+        # submitted during the model load, or while the GPU was busy) up to the batch limit.
+        with SCHED.cv:
+            if SCHED.token_batch is batch:
+                for s in sorted(SCHED.songs, key=lambda s: s.priority):
+                    if len(songs) >= MAX_BATCH:
+                        break
+                    if s.state == QUEUED and not s.cancel.is_set() and s.mode == songs[0].mode and s.needs_plan == songs[0].needs_plan and s not in songs:
+                        s.state = PLANNING if s.needs_plan else TOKENIZING
+                        songs.append(s)
+                SCHED.token_batch = songs
+        n = len(songs)
+        tokenizer = pipe.tokenizer
+        cancelled = lambda: all(s.cancel.is_set() for s in songs)
+        log(f"Tokenizing batch: {[s.label for s in songs]} (priorities {[s.priority for s in songs]})")
+        counts = [0] * n; last = [0.0]
 
-    counts = [0] * n; last = [0.0]
-    def reporter(phase, expected, prefix_len):
-        """Per-song progress and throughput. A batch step costs the same however many rows are still
-        producing, so each row's figure is its own tokens per second; a row that reached its end token
-        waits for the rest of the batch and shows no rate."""
-        from yue2.protocol import ABC_END, MUSIC_END
-        end = ABC_END if phase == "abc" else MUSIC_END
-        rates, reported, finished = [Rate() for _ in items], [0] * n, [False] * n
-        for r in rates:
-            r.add(0)
-        def on_token(row, _phase, token):
-            counts[row] += 1
-            if token == end:
-                finished[row] = True
-            if time.perf_counter() - last[0] > 0.5 or finished[row]:
-                last[0] = time.perf_counter()
-                for i, it in enumerate(items):
-                    if finished[i]:
-                        if reported[i] >= 0:
-                            it.progress(1.0, "tokens finished"); reported[i] = -1
-                        continue
-                    gflops = rates[i].add((counts[i] - reported[i]) * flops_per_token(model.config, prefix_len + counts[i]))
-                    reported[i] = counts[i]
-                    detail = f"{counts[i]} score tokens" if phase == "abc" else f"{counts[i]} tokens (about {counts[i] / 25:.0f} s of audio)"
-                    it.progress(min(1.0, counts[i] / expected), detail, gflops)
-        return on_token
+        def reporter(phase, expected, prefix_len):
+            """Per-song progress and throughput: a batch step costs the same however many rows still
+            produce, so each row's figure is its own tokens per second."""
+            from yue2.protocol import ABC_END, MUSIC_END
+            end = ABC_END if phase == "abc" else MUSIC_END
+            rates, reported, finished = [Rate() for _ in songs], [0] * n, [False] * n
+            for r in rates:
+                r.add(0)
+            def on_token(row, _phase, token):
+                counts[row] += 1
+                if token == end or (phase == "semantic" and counts[row] >= songs[row].limit):
+                    finished[row] = True
+                if time.perf_counter() - last[0] > 0.5 or finished[row]:
+                    last[0] = time.perf_counter()
+                    for i, s in enumerate(songs):
+                        if finished[i]:
+                            if reported[i] >= 0:
+                                s.progress(1.0, "tokens finished"); reported[i] = -1
+                            continue
+                        gflops = rates[i].add((counts[i] - reported[i]) * flops_per_token(model.config, prefix_len + counts[i]))
+                        reported[i] = counts[i]
+                        detail = f"{counts[i]} score tokens" if phase == "abc" else f"{counts[i]} tokens (about {counts[i] / 25:.0f} s of audio)"
+                        s.progress(min(1.0, counts[i] / expected), detail, gflops)
+            return on_token
 
-    requests = [it.request for it in items]
-    instrumental = bool(req.get("instrumental"))
-    if mode == "off" or abc:
-        plans = [pipe.plan(request=r) for r in requests]
-    else:
-        for it in items:
-            it.set_stage("planning", "planning the score")
-        prefixes = [token_prefixes(r, tokenizer) for r in requests]
-        rows, timing = generate_tokens_batched(model, prefixes, pipe.generation_config.abc, [it.seed for it in items], "abc",
-                                               cancelled=cancelled, on_token=reporter("abc", 900, max(len(p) for p in prefixes)), lock=TORCH_LOCK)
-        plans = [SymbolicPlan(r, tokenizer.decode(ids), ids, token_prefixes(r, tokenizer, ids), t, trunc)
-                 for r, (ids, t, trunc) in zip(requests, rows)]
-        log(f"Scores planned for {job.id}: {[len(p.abc_ids) for p in plans]} tokens in {timing['seconds']:.0f} s")
-    if instrumental and not abc:
-        # Re-plan from each score with its vocal voice silenced: the tokens then carry no sung melody.
-        from yue2.instrumental import silence_vocals
-        import dataclasses as dc
-        plans = [pipe.plan(request=dc.replace(p.request, abc=silence_vocals(p.abc))) if p.abc else p for p in plans]
-        log(f"Instrumental: vocal voice silenced in the planned score(s) for {job.id}")
-    counts[:] = [0] * n
-    for it in items:
-        it.set_stage("tokens", "generating song tokens")
-    sampling = dataclasses.replace(pipe.generation_config.semantic, max_tokens=max_tokens)
-
-    released = set()
-    def release_song(i, tokens, t, truncated):
-        """Hand a song to synthesis: as soon as its row ends (while the batch continues), or after the batch."""
-        it, plan = items[i], plans[i]
-        it.plan, it.codec, it.semantic_timing, it.truncated = plan, [int(x) - CODEC_OFFSET for x in tokens], t, truncated
-        it.engine = choose_engine(engine, pipe, len(it.codec), it.quality)
-        save_tokens(it)
-        released.add(i)
-        if it.cancel.is_set():
-            PIPELINE.finish(it, "cancelled", "stopped"); return
-        it.set_stage("synth", "waiting", engine=it.engine)
-        PIPELINE.synth.put(it)
-    def on_row_done(i, tokens, t):
-        if i not in released:
-            log(f"Song tokens for {items[i].label}: {len(tokens)} ({t['seconds']:.0f} s); synthesis can start while the batch continues")
-            release_song(i, tokens, t, False)
-
-    rows, timing = generate_tokens_batched(model, [p.prefix for p in plans], sampling, [it.seed for it in items], "semantic",
-                                           legacy_off=(mode == "off"), cancelled=cancelled,
-                                           on_token=reporter("semantic", max_tokens, max(len(p.prefix) for p in plans)), lock=TORCH_LOCK,
-                                           on_row_done=on_row_done)
-    log(f"Song tokens for {job.id}: {[len(r[0]) for r in rows]} in {timing['seconds']:.0f} s ({1000 * (timing['mean_step_seconds'] or 0):.0f} ms per step)")
-    for i, (tokens, t, truncated) in enumerate(rows):
-        if i in released:
-            items[i].semantic_timing = t          # final figures for the record
+        requests = [s.request for s in songs]
+        if songs[0].needs_plan:
+            for s in songs:
+                s.set_state(PLANNING, "planning the score")
+            prefixes = [token_prefixes(r, tokenizer) for r in requests]
+            rows, timing = generate_tokens_batched(model, prefixes, pipe.generation_config.abc, [s.seed for s in songs], "abc",
+                                                   cancelled=cancelled, on_token=reporter("abc", 900, max(len(p) for p in prefixes)),
+                                                   lock=TORCH_LOCK)
+            plans = [SymbolicPlan(r, tokenizer.decode(ids), ids, token_prefixes(r, tokenizer, ids), t, trunc)
+                     for r, (ids, t, trunc) in zip(requests, rows)]
+            log(f"Scores planned: {[len(p.abc_ids) for p in plans]} tokens in {timing['seconds']:.0f} s")
+            if any(s.instrumental for s in songs):
+                # Re-plan from each score with its vocal voice silenced: the tokens then carry no sung melody.
+                from yue2.instrumental import silence_vocals
+                plans = [pipe.plan(request=dataclasses.replace(p.request, abc=silence_vocals(p.abc))) if (s.instrumental and p.abc) else p
+                         for s, p in zip(songs, plans)]
+                log("Instrumental: vocal voice silenced in the planned score(s)")
         else:
-            release_song(i, tokens, t, truncated)
+            plans = [pipe.plan(request=r) for r in requests]
+        counts[:] = [0] * n
+        for s in songs:
+            s.set_state(TOKENIZING, "generating song tokens")
+        limits = [s.limit for s in songs]
+        sampling = dataclasses.replace(pipe.generation_config.semantic, max_tokens=max(limits))
+
+        released = set()
+        def release_song(i, tokens, t, truncated):
+            s, plan = songs[i], plans[i]
+            released.add(i)
+            s.plan, s.codec, s.timing, s.truncated = plan, [int(x) - CODEC_OFFSET for x in tokens], t, truncated
+            s.decide_engine()
+            save_tokens(s)
+            if s.cancel.is_set():
+                SCHED.finish(s, CANCELLED, "stopped"); return
+            log(f"Song tokens for {s.label}: {len(tokens)} ({t['seconds']:.0f} s)" + (", truncated" if truncated else "")
+                + ("; Neural Engine" if s.wants_ane else "; GPU"))
+            s.set_state(SYNTH_WAIT, "waiting", engine="ane" if s.wants_ane else "mlx")
+            SCHED.tick()                                   # synthesis can start while the batch continues
+        def on_row_done(i, tokens, t):
+            if i not in released:
+                release_song(i, tokens, t, bool(t.get("truncated", False)))
+
+        rows, timing = generate_tokens_batched(model, [p.prefix for p in plans], sampling, [s.seed for s in songs], "semantic",
+                                               legacy_off=(songs[0].mode == "off"), cancelled=cancelled,
+                                               on_token=reporter("semantic", max(limits), max(len(p.prefix) for p in plans)),
+                                               lock=TORCH_LOCK, on_row_done=on_row_done, limits=limits)
+        log(f"Batch done: {[len(r[0]) for r in rows]} tokens in {timing['seconds']:.0f} s ({1000 * (timing['mean_step_seconds'] or 0):.0f} ms per step)")
+        for i, (tokens, t, truncated) in enumerate(rows):
+            if i in released:
+                songs[i].timing = t
+            else:
+                release_song(i, tokens, t, truncated)
+    except InterruptedError:
+        for s in songs:
+            if s.state in (PLANNING, TOKENIZING):
+                SCHED.finish(s, CANCELLED, "stopped")
+    except Exception as exc:
+        for s in songs:
+            if s.state in (PLANNING, TOKENIZING):
+                fail(s, exc)
+    finally:
+        with SCHED.cv:
+            SCHED.token_batch = None
+        SCHED.tick()
 
 
-# ── Synthesis lanes ──────────────────────────────────────────────────────────
-# Two lanes share the synthesis queue. The Neural Engine lane takes full-quality songs. The GPU
-# lane takes drafts and songs the Neural Engine cannot compile, and, when the GPU has nothing else
-# to do, a full-quality song that would otherwise wait: it starts on MLX and moves to the Neural
-# Engine mid-solve as soon as that is free (nar_switch), giving the GPU back for rendering.
-LANES = {"tokens": False, "decode": False, "gpu_synth": False, "ane": "idle", "migrate_wanted": False,
-         "ane_gpu": False}                      # the Neural Engine lane's song is on the GPU (prefix prefill)
-SCHED = PIPELINE.synth.cv                        # one condition for the queue and the lane state
-
-
-def set_lane(**changes):
-    with SCHED:
-        LANES.update(changes); SCHED.notify_all()
-
-
-def gpu_idle():
-    """Nothing is using or about to use the GPU (tokenizing, rendering, a GPU-lane song)."""
-    return CONCURRENT and not LANES["tokens"] and not LANES["decode"] and not LANES["gpu_synth"] \
-        and not PIPELINE.jobs.items and not PIPELINE.decode.items
-
-
-def ane_lane():
-    while True:
-        item = PIPELINE.synth.take(lambda it: it.engine == "ane" and LANES["ane"] == "idle" and not LANES["migrate_wanted"],
-                                   on_take=lambda: LANES.update(ane="lane"))
-        try:
-            run_synth(item, "ane")
-        finally:
-            set_lane(ane="idle", ane_gpu=False)
-
-
-def gpu_lane():
-    """One GPU song at a time; each runs in its own thread so the lane is free again the moment a
-    song moves to the Neural Engine, even though that song's solve continues."""
-    while True:
-        item = PIPELINE.synth.take(lambda it: not LANES["gpu_synth"] and (it.engine != "ane" or (LANES["ane"] != "idle" and gpu_idle())),
-                                   on_take=lambda: LANES.update(gpu_synth=True))
-        def run(item=item):
-            try:
-                run_synth(item, "gpu")
-            finally:
-                with SCHED:
-                    if getattr(item, "migrated", False):
-                        LANES["ane"] = "idle"
-                    else:
-                        LANES["gpu_synth"] = False
-                    LANES["migrate_wanted"] = False
-                    SCHED.notify_all()
-        threading.Thread(target=run, name=f"gpu-{item.label}", daemon=True).start()
-
-
-def run_synth(item, lane):
-    if item.cancel.is_set():
-        PIPELINE.finish(item, "cancelled", "stopped"); return
-    with stage_lock():
-        try:
-            synthesize_item(item, lane)
-            if item.cancel.is_set():
-                PIPELINE.finish(item, "cancelled", "stopped"); return
-            item.set_stage("decode", "waiting", engine=item.used_engine)
-            PIPELINE.decode.put(item)
-        except InterruptedError:
-            PIPELINE.finish(item, "cancelled", "stopped")
-        except Exception as exc:
-            traceback.print_exc(file=sys.stderr)
-            log(f"Synthesis failed for {item.label}: {type(exc).__name__}: {exc}")
-            emit(event="failed", path=item.path, message=f"{type(exc).__name__}: {exc}")
-            PIPELINE.finish(item, "failed", str(exc)[:200])
-
-
-WARMING = threading.Lock()
-
-
-def warm_next(pipe, model, current):
-    """While the Neural Engine solves this song, compile the programs of the next Neural Engine song
-    in the queue (a different length bucket) so it starts without waiting for the compiler. Songs in
-    the same bucket reuse this song's program and need no compile."""
-    from yue2.ane import runtime as ane_runtime
-    from yue2.nar import song_chunks
-    if not WARMING.acquire(blocking=False):
-        return
-    def warm():
-        try:
-            for nxt in PIPELINE.synth.snapshot():
-                if nxt.engine != "ane" or nxt.cancel.is_set() or nxt.codec is None:
-                    continue
-                chunk = song_chunks(nxt.plan.prefix, nxt.codec, nxt.seed)[0]
-                S, P = ane_runtime.buckets_for((len(chunk.noise) + 2, len(chunk.ar_tokens)))
-                if (S, P) in ane_runtime.programs_for(model).loaded:
-                    nxt.set_stage("synth", f"waiting for {current.label.split('/')[-1]} · Neural Engine program ready", engine="ane")
-                    continue
-                nxt.set_stage("synth", f"waiting for {current.label.split('/')[-1]} · compiling its Neural Engine program meanwhile", engine="ane")
-                log(f"Background: compiling Neural Engine programs for {nxt.label} (bucket {S} x {P})")
-                t0 = time.perf_counter()
-                ane_runtime.programs_for(model).precompile(S, P)
-                log(f"Background: Neural Engine programs for {nxt.label} ready in {time.perf_counter() - t0:.0f} s")
-                if nxt.stage == "synth" and not nxt.cancel.is_set():
-                    nxt.set_stage("synth", f"waiting for {current.label.split('/')[-1]} · Neural Engine program ready", engine="ane")
-                break
-        except Exception as exc:
-            log(f"Background compile failed: {str(exc).splitlines()[0][:160]}")
-        finally:
-            WARMING.release()
-    threading.Thread(target=warm, daemon=True).start()
-
-
-def synthesize_item(item, lane):
-    from yue2.nar import synthesize
-    from yue2.nar_switch import synthesize_switchable
-    from yue2.ane import runtime as ane_runtime
-    pipe, model = acquire_model()
-    if item.plan is None:
-        raise ValueError("song has no plan")
-    engine = item.engine
-    audio_s = len(item.codec) / 25
-    switching = lane == "gpu" and engine == "ane"
-    log(f"Synthesizing {item.label}: about {audio_s:.0f} s of audio, {item.quality} quality ({item.steps} steps), "
-        + ("on the GPU until the Neural Engine is free" if switching else f"engine {engine}"))
-    item.set_stage("synth", "preparing", engine="mlx" if switching else engine)
-    def on_prepare(done, total):
-        item.progress(0.0, f"compiling Neural Engine program {done}/{total}")
-        if done in (1, total):
-            log(f"Neural Engine program {done}/{total} ready for {item.label}")
-    warmed = [False]
-    S, P = len(item.codec) + 2, len(item.plan.prefix) + len(item.codec) + 1
+def synth_common(song, model, pipe):
+    """Progress, throughput and phase callbacks shared by both synthesis resources."""
+    audio_s = song.frames / 25
+    S, P = song.frames + 2, len(song.plan.prefix) + song.frames + 1
     per_step = 2 * flops_per_pass(model.config, S, P)               # midpoint solver: two passes per step
     rate, seen = Rate(), [0]
     def on_nar(done, total):
-        if item.used_engine == "ane" and not warmed[0]:
-            warmed[0] = True; warm_next(pipe, model, item)
         if seen[0] == 0:
             rate.last = time.perf_counter(); gflops = None            # the first step also carried the prefill/compile: skip it
         else:
             gflops = rate.add((done - seen[0]) * per_step)
         seen[0] = done
-        item.progress(done / max(total, 1), f"solver step {done}/{total}", gflops)
-    def on_phase(text):
-        item.progress(0.0, text)
-        if lane == "ane":
-            set_lane(ane_gpu=text.startswith("prefilling"))     # a GPU-lane song yields while this runs
-    kwargs = dict(steps=item.steps, context=pipe.generation_config.context, cancelled=item.cancel.is_set,
-                  on_progress=on_nar, lock=TORCH_LOCK, on_phase=on_phase)
-    t0 = time.perf_counter()
-    if switching:
-        item.used_engine = "mlx"
-        # Compile this song's Neural Engine program in the background; the move waits for it.
-        bucket = ane_runtime.buckets_for((S, P))
-        programs = ane_runtime.programs_for(model)
-        ready, failed = threading.Event(), [False]
-        if bucket in programs.loaded:
-            ready.set()
-        else:
-            def compile_():
-                try:
-                    log(f"Background: compiling Neural Engine programs for {item.label} (bucket {bucket[0]} x {bucket[1]})")
+        song.progress(done / max(total, 1), f"solver step {done}/{total}", gflops)
+    def on_prepare(done, total):
+        song.progress(0.0, f"compiling Neural Engine program {done}/{total}")
+        if done in (1, total):
+            log(f"Neural Engine program {done}/{total} ready for {song.label}")
+    return dict(steps=song.steps, context=pipe.generation_config.context, cancelled=song.cancel.is_set,
+                on_progress=on_nar, on_prepare=on_prepare, lock=TORCH_LOCK), audio_s, (S, P)
+
+
+WARMING = threading.Lock()
+
+
+def precompile(song, model, why):
+    """Compile a song's Neural Engine program in the background; sets song.program_ready."""
+    from yue2.ane import runtime as ane_runtime
+    S, P = song.frames + 2, len(song.plan.prefix) + song.frames + 1
+    bucket = ane_runtime.buckets_for((S, P))
+    programs = ane_runtime.programs_for(model)
+    if bucket in programs.loaded:
+        song.program_ready.set(); return
+    def work():
+        with WARMING:                                 # the compiler service is single-threaded anyway
+            try:
+                if bucket not in programs.loaded:
+                    log(f"Background: compiling Neural Engine programs for {song.label} (bucket {bucket[0]} x {bucket[1]}) {why}")
+                    t0 = time.perf_counter()
                     programs.precompile(*bucket)
-                    log(f"Background: Neural Engine programs for {item.label} ready")
-                except Exception as exc:
-                    failed[0] = True
-                    log(f"{item.label} stays on the GPU: the Neural Engine cannot compile its program ({str(exc).splitlines()[0][:100]})")
-                finally:
-                    ready.set()
-            threading.Thread(target=compile_, daemon=True).start()
-        def may_switch():
-            if getattr(item, "migrated", False):
-                return True                                          # already claimed the Neural Engine
-            if failed[0] or not ready.is_set() or item.cancel.is_set():
-                return False
-            with SCHED:
-                if LANES["ane"] != "idle":
-                    if not LANES["migrate_wanted"]:
-                        LANES["migrate_wanted"] = True          # claim the Neural Engine for when it frees
-                        item.set_stage("synth", "on the GPU · moves to the Neural Engine when it is free", engine="mlx")
-                    return False
-                LANES["ane"], LANES["migrate_wanted"] = "migrated", False
-                item.migrated = True
-                SCHED.notify_all()
-                return True
-        def on_switch(step):
-            log(f"{item.label} moved to the Neural Engine at solver step {step}/{item.steps}")
-            item.used_engine = "ane"
-            item.set_stage("synth", f"moved to the Neural Engine at step {step}", engine="ane")
-            set_lane(gpu_synth=False)                                # the GPU lane may take its next song
+                    log(f"Background: Neural Engine programs for {song.label} ready in {time.perf_counter() - t0:.0f} s")
+            except Exception as exc:
+                song.program_failed = True
+                log(f"{song.label}: the Neural Engine cannot compile its program ({str(exc).splitlines()[0][:100]})")
+            finally:
+                song.program_ready.set()
+                SCHED.tick()
+    threading.Thread(target=work, daemon=True).start()
+
+
+def run_ane(song):
+    """Synthesize on the Neural Engine."""
+    from yue2.nar import synthesize
+    try:
+        pipe, model = acquire_model()
+        kwargs, audio_s, _ = synth_common(song, model, pipe)
+        log(f"Synthesizing {song.label} on the Neural Engine: about {audio_s:.0f} s of audio, {song.quality} quality ({song.steps} steps)")
+        song.set_state(SYNTHING, "preparing", engine="ane")
+        warmed = [False]
+        on_nar = kwargs["on_progress"]
+        def on_nar_warm(done, total):
+            if not warmed[0]:                          # solving: compile the next Neural Engine song's program meanwhile
+                warmed[0] = True
+                with SCHED.cv:
+                    nxt = next((s for s in sorted(SCHED.songs, key=lambda s: s.priority)
+                                if s.state == SYNTH_WAIT and s.wants_ane and not s.program_ready.is_set()), None)
+                if nxt is not None:
+                    precompile(nxt, model, "while the current song solves")
+            on_nar(done, total)
+        def on_phase(text):
+            song.progress(0.0, text)
+            with SCHED.cv:
+                SCHED.ane_prefill = text.startswith("prefilling")
+            SCHED.tick()
+        kwargs.update(on_progress=on_nar_warm, on_phase=on_phase)
+        song.used_engine = "ane"
+        t0 = time.perf_counter()
+        try:
+            latents = synthesize(model, song.plan.prefix, song.codec, song.seed, engine="ane", offload_ar=pipe.offload_ar, **kwargs)
+        except RuntimeError as exc:
+            if not str(exc).startswith("compile"):
+                raise
+            # The compiler rejects some very large shapes; the song goes back to wait for the GPU.
+            log(f"The Neural Engine cannot compile programs for {song.label} ({str(exc).splitlines()[0][:100]}); it will use the GPU")
+            song.wants_ane = False; song.program_failed = True
+            with SCHED.cv:
+                SCHED.ane_synth = None; SCHED.ane_prefill = False
+            song.set_state(SYNTH_WAIT, "waiting for the GPU", engine="mlx")
+            SCHED.tick(); return
+        song.latents = latents.detach().float().cpu().numpy()
+        song.nar_seconds = time.perf_counter() - t0
+        log(f"Synthesis of {song.label} done in {song.nar_seconds:.0f} s ({song.nar_seconds / audio_s:.1f} s per second of audio, "
+            f"{song.steps} steps, ane)")
+        with SCHED.cv:
+            SCHED.ane_synth = None; SCHED.ane_prefill = False
+        if song.cancel.is_set():
+            SCHED.finish(song, CANCELLED, "stopped"); return
+        song.set_state(RENDER_WAIT, "waiting", engine="ane")
+        SCHED.tick()
+    except InterruptedError:
+        with SCHED.cv:
+            SCHED.ane_synth = None; SCHED.ane_prefill = False
+        SCHED.finish(song, CANCELLED, "stopped")
+    except Exception as exc:
+        with SCHED.cv:
+            SCHED.ane_synth = None; SCHED.ane_prefill = False
+        fail(song, exc)
+
+
+def run_gpu(song):
+    """Synthesize on the GPU (MLX). A full-quality song moves to the Neural Engine when the
+    scheduler grants it, and pauses between steps whenever the GPU is wanted elsewhere."""
+    from yue2.nar_switch import synthesize_switchable
+    try:
+        pipe, model = acquire_model()
+        kwargs, audio_s, _ = synth_common(song, model, pipe)
+        kwargs["on_phase"] = lambda text: song.progress(0.0, text)
+        song.used_engine = "mlx"
+        t0 = time.perf_counter()
+        movable = song.wants_ane
+        if movable:
+            log(f"Synthesizing {song.label} on the GPU until the Neural Engine is granted: about {audio_s:.0f} s of audio ({song.steps} steps)")
+            song.set_state(SYNTHING, "on the GPU · moves to the Neural Engine when granted", engine="mlx")
+            precompile(song, model, "for the move")
+            SCHED.tick()                                   # the program may already be compiled
+        else:
+            log(f"Synthesizing {song.label} on the GPU: about {audio_s:.0f} s of audio, {song.quality} quality ({song.steps} steps)")
+            song.set_state(SYNTHING, "preparing", engine="mlx")
+        idle_text = "on the GPU · moves to the Neural Engine when granted" if movable else "on the GPU"
         paused = [False]
         def should_wait():
-            # Tokenizing and rendering own the GPU: MLX's long kernels would starve them (25x slower
-            # token steps measured), so a GPU-lane song sits out until they are done or the Neural
-            # Engine takes it.
-            busy = LANES["tokens"] or LANES["decode"] or LANES["ane_gpu"]
+            # Tokenizing, rendering and the Neural Engine song's prefill own the GPU: MLX's long
+            # kernels would starve them, so this song sits out until they are done.
+            busy = SCHED.gpu_wanted_elsewhere()
             if busy != paused[0]:
                 paused[0] = busy
                 if busy:
-                    what = "tokenizing" if LANES["tokens"] else "rendering" if LANES["decode"] else "prefilling for the Neural Engine"
-                    log(f"{item.label} pauses: the GPU is {what}")
-                    item.set_stage("synth", f"paused · the GPU is busy {what} · resumes or moves to the Neural Engine", engine="mlx")
+                    what = "tokenizing" if SCHED.token_batch is not None else "rendering" if SCHED.render is not None else "prefilling for the Neural Engine"
+                    log(f"{song.label} pauses: the GPU is {what}")
+                    song.set_state(SYNTHING, f"paused · the GPU is busy {what}", engine="mlx")
                 else:
-                    log(f"{item.label} resumes on the GPU")
-                    item.set_stage("synth", "on the GPU · moves to the Neural Engine when it is free", engine="mlx")
+                    log(f"{song.label} resumes on the GPU")
+                    song.set_state(SYNTHING, idle_text, engine="mlx")
             return busy
-        item.set_stage("synth", "on the GPU · moves to the Neural Engine when it is free", engine="mlx")
-        latents, used, switched_at = synthesize_switchable(model, item.plan.prefix, item.codec, item.seed, may_switch=may_switch,
-                                                           on_switch=on_switch, on_prepare=on_prepare, should_wait=should_wait, **kwargs)
-        item.used_engine = "mlx+ane" if switched_at is not None else "mlx"
-    else:
-        item.used_engine = engine
-        try:
-            latents = synthesize(model, item.plan.prefix, item.codec, item.seed, engine=engine, on_prepare=on_prepare,
-                                 offload_ar=pipe.offload_ar, **kwargs)
-        except RuntimeError as exc:
-            # The Neural Engine compiler rejects some very large shapes; the song is not lost.
-            if engine != "ane" or not str(exc).startswith("compile"):
-                raise
-            log(f"The Neural Engine cannot compile programs for this song's length ({str(exc).splitlines()[0][:100]}); "
-                f"synthesizing it on the GPU with MLX instead")
-            item.used_engine = "mlx"; item.set_stage("synth", "preparing", engine="mlx"); t0 = time.perf_counter()
-            latents = synthesize(model, item.plan.prefix, item.codec, item.seed, engine="mlx", offload_ar=pipe.offload_ar, **kwargs)
-    item.latents = latents.detach().float().cpu().numpy()
-    item.nar_seconds = time.perf_counter() - t0
-    log(f"Synthesis of {item.label} done in {item.nar_seconds:.0f} s ({item.nar_seconds / audio_s:.1f} s per second of audio, "
-        f"{item.steps} steps, {item.used_engine})")
+        def on_switch(step):
+            song.migrated = True; song.used_engine = "ane"
+            log(f"{song.label} moved to the Neural Engine at solver step {step}/{song.steps}")
+            song.set_state(SYNTHING, f"moved to the Neural Engine at step {step}", engine="ane")
+            with SCHED.cv:
+                if SCHED.gpu_synth is song:
+                    SCHED.gpu_synth = None                   # the GPU is free for the next song
+            SCHED.tick()
+        latents, used, switched_at = synthesize_switchable(model, song.plan.prefix, song.codec, song.seed,
+                                                           may_switch=(lambda: song.migrate) if movable else None,
+                                                           should_wait=should_wait, on_switch=on_switch, **kwargs)
+        song.used_engine = "mlx+ane" if switched_at is not None else "mlx"
+        song.latents = latents.detach().float().cpu().numpy()
+        song.nar_seconds = time.perf_counter() - t0
+        log(f"Synthesis of {song.label} done in {song.nar_seconds:.0f} s ({song.nar_seconds / audio_s:.1f} s per second of audio, "
+            f"{song.steps} steps, {song.used_engine})")
+        with SCHED.cv:
+            if SCHED.gpu_synth is song:
+                SCHED.gpu_synth = None
+            if SCHED.ane_synth is song:
+                SCHED.ane_synth = None
+        if song.cancel.is_set():
+            SCHED.finish(song, CANCELLED, "stopped"); return
+        song.set_state(RENDER_WAIT, "waiting", engine=song.used_engine)
+        SCHED.tick()
+    except InterruptedError:
+        SCHED.finish(song, CANCELLED, "stopped")
+    except Exception as exc:
+        fail(song, exc)
 
 
-def decode_stage():
-    while True:
-        item = PIPELINE.decode.get()
-        if item.cancel.is_set():
-            PIPELINE.finish(item, "cancelled", "stopped"); continue
-        with stage_lock():
-            set_lane(decode=True)
-            try:
-                decode_item(item)
-                PIPELINE.finish(item, "ready")
-            except InterruptedError:
-                PIPELINE.finish(item, "cancelled", "stopped")
-            except Exception as exc:
-                traceback.print_exc(file=sys.stderr)
-                log(f"Decoding failed for {item.label}: {type(exc).__name__}: {exc}")
-                emit(event="failed", path=item.path, message=f"{type(exc).__name__}: {exc}")
-                PIPELINE.finish(item, "failed", str(exc)[:200])
-            finally:
-                item.latents = None
-                set_lane(decode=False)
-
-
-def decode_item(item):
+def run_render(song):
+    """Decode the latents to a waveform on the GPU and write the song's files."""
     from yue2.pipeline import SemanticResult, SongResult
     from yue2.storage import identity
-    pipe, _ = acquire_model()
-    item.set_stage("decode", "decoding waveform", engine=item.used_engine)
-    item.progress(0.5, "decoding waveform")
-    t1 = time.perf_counter()
-    rate, seen = Rate(), [0]
-    rate.add(0)
-    def on_tile(done, total):
-        gflops = rate.add((done - seen[0]) * pipe.vae_core_frames * VAE_GFLOP_PER_FRAME * 1e9); seen[0] = done
-        item.progress(done / max(total, 1), f"decoding tile {done}/{total}", gflops)
-        if item.cancel.is_set():
+    try:
+        pipe, _ = acquire_model()
+        song.set_state(RENDERING, "decoding waveform", engine=song.used_engine)
+        rate, seen = Rate(), [0]
+        rate.add(0)
+        def on_tile(done, total):
+            gflops = rate.add((done - seen[0]) * pipe.vae_core_frames * VAE_GFLOP_PER_FRAME * 1e9); seen[0] = done
+            song.progress(done / max(total, 1), f"decoding tile {done}/{total}", gflops)
+            if song.cancel.is_set():
+                raise InterruptedError("stopped")
+            TORCH_LOCK.yield_turn()                  # let a waiting token step or prefill in between tiles
+        t1 = time.perf_counter()
+        with TORCH_LOCK:
+            audio = pipe.decode(song.latents, on_progress=on_tile)
+        if song.cancel.is_set():
             raise InterruptedError("stopped")
-        TORCH_LOCK.yield_turn()                  # let a waiting token step or prefill in between tiles
-    with TORCH_LOCK:
-        audio = pipe.decode(item.latents, on_progress=on_tile)
-    if item.cancel.is_set():
-        raise InterruptedError("stopped")
-    plan = item.plan
-    config = pipe.effective_config(plan.request)
-    config.update({"execution": "eager_batched", "nar_engine": item.used_engine, "ode_steps": item.steps, "quality": item.quality})
-    semantic = SemanticResult(plan, item.codec, item.semantic_timing or {}, item.truncated)
-    song = SongResult(audio, 48000, semantic, item.latents, config, pipe.weights,
-                      {"semantic": item.semantic_timing or {}, "nar_seconds": item.nar_seconds, "vae_seconds": time.perf_counter() - t1},
-                      identity({"request": plan.request.to_dict(), "config": config, "weights": pipe.weights}))
-    directory = item.directory
-    if item.quality == "full" and (directory / "audio.flac").exists() and \
-            json.loads((directory / "result.json").read_text()).get("quality") == "draft":
-        (directory / "audio.flac").replace(directory / "draft.flac")      # keep the preview beside the final render
-    result = song.save_artifacts(directory)
-    result.update({"quality": item.quality, "ode_steps": item.steps, "nar_engine": item.used_engine})
-    (directory / "result.json").write_text(json.dumps(result, indent=2))
-    length = len(audio) / 48000
-    log(f"Saved {directory / 'audio.flac'} ({length:.1f} s, {item.quality})")
-    emit(event="song", index=item.index, path=item.path, score=plan.abc or "", seconds=round(length, 1), seed=item.seed,
-         truncated=bool(item.truncated or plan.truncated), quality=item.quality, steps=item.steps, engine=item.used_engine)
+        plan = song.plan
+        config = pipe.effective_config(plan.request)
+        config.update({"execution": "eager_batched", "nar_engine": song.used_engine, "ode_steps": song.steps, "quality": song.quality})
+        semantic = SemanticResult(plan, song.codec, song.timing or {}, song.truncated)
+        result_song = SongResult(audio, 48000, semantic, song.latents, config, pipe.weights,
+                                 {"semantic": song.timing or {}, "nar_seconds": song.nar_seconds, "vae_seconds": time.perf_counter() - t1},
+                                 identity({"request": plan.request.to_dict(), "config": config, "weights": pipe.weights}))
+        directory = song.directory
+        if song.quality == "full" and (directory / "audio.flac").exists() and \
+                json.loads((directory / "result.json").read_text()).get("quality") == "draft":
+            (directory / "audio.flac").replace(directory / "draft.flac")      # keep the preview beside the final render
+        result = result_song.save_artifacts(directory)
+        result.update({"quality": song.quality, "ode_steps": song.steps, "nar_engine": song.used_engine, "priority": song.priority})
+        (directory / "result.json").write_text(json.dumps(result, indent=2))
+        length = len(audio) / 48000
+        log(f"Saved {directory / 'audio.flac'} ({length:.1f} s, {song.quality})")
+        emit(event="song", index=song.index, path=song.path, score=plan.abc or "", seconds=round(length, 1), seed=song.seed,
+             truncated=bool(song.truncated or plan.truncated), quality=song.quality, steps=song.steps, engine=song.used_engine)
+        SCHED.finish(song, DONE)
+    except InterruptedError:
+        SCHED.finish(song, CANCELLED, "stopped")
+    except Exception as exc:
+        fail(song, exc)
+    finally:
+        song.latents = None
 
 
 # ── Requests ─────────────────────────────────────────────────────────────────
@@ -725,7 +715,8 @@ def submit_generate(req):
     from yue2.protocol import SongRequest
     n = int(req.get("batch", 1)); mode = req.get("cot", "full")
     style, lyrics = req["style"].strip(), req["lyrics"].strip()
-    if req.get("instrumental"):
+    instrumental = bool(req.get("instrumental"))
+    if instrumental:
         from yue2.instrumental import instrumental_tags, structure_only
         style, lyrics = instrumental_tags(style), structure_only(lyrics)
         if mode == "off":
@@ -736,25 +727,22 @@ def submit_generate(req):
     abc = (req.get("abc") or "").strip() or None
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out_root = OUTPUT_DIR / stamp
-    with PIPELINE.lock:
-        taken = {it.directory.parent for it in PIPELINE.live.values()}
+    with SCHED.cv:
+        taken = {s.directory.parent for s in SCHED.songs}
     while out_root in taken or out_root.exists():                                      # two jobs in one second
         stamp += "b"; out_root = OUTPUT_DIR / stamp
     steps = steps_for(quality, req)
-    items = []
+    limit = max(1, min(int(req.get("max_tokens", 9000)), 9000))
+    songs = []
     for i, seed in enumerate(seeds):
         request = SongRequest(style=style, lyrics=lyrics, cot=mode, seed=seed, abc=abc,
                               id=f"song{i + 1}", **({"cfg_scale": 1.0} if mode == "off" else {}))
-        items.append(Item(None, i + 1, seed, request, out_root / f"song{i + 1}", quality, steps, req.get("engine", "auto")))
-    job = Job(stamp, dict(req, cot=mode), items)
-    for it in items:
-        it.job = job
-    PIPELINE.add(items)
-    emit(event="started", job=stamp, output=str(out_root), songs=[{"index": it.index, "seed": it.seed, "path": it.path} for it in items])
-    for it in items:
-        it.set_stage("queued", "waiting for the GPU")
-    log(f"Queued {stamp}: {n} song(s), {quality} quality ({steps} steps), seeds {seeds}" + (", instrumental" if req.get("instrumental") else ""))
-    PIPELINE.jobs.put(job)
+        songs.append(Song(stamp, i + 1, seed, request, out_root / f"song{i + 1}", quality, steps, limit, instrumental))
+    emit(event="started", job=stamp, output=str(out_root),
+         songs=[{"index": s.index, "seed": s.seed, "path": s.path, "priority": s.priority} for s in songs])
+    log(f"Queued {stamp}: {n} song(s), {quality} quality ({steps} steps), seeds {seeds}, priorities {[s.priority for s in songs]}"
+        + (", instrumental" if instrumental else ""))
+    SCHED.submit(songs)
 
 
 def submit_render(req):
@@ -765,7 +753,7 @@ def submit_render(req):
     directory = Path(req["path"])
     if directory.is_file():
         directory = directory.parent
-    if str(directory / "audio.flac") in PIPELINE.live:
+    if SCHED.find(str(directory / "audio.flac")) is not None:
         emit(event="error", message=f"{directory.name} is already queued"); return
     quality = "draft" if req.get("quality", "full") == "draft" else "full"
     plan = SymbolicPlan.load(directory)
@@ -777,16 +765,15 @@ def submit_render(req):
     truncated = previous.get("truncated")
     truncated = bool(truncated.get("semantic", False) if isinstance(truncated, dict) else truncated)
     index = int(directory.name[4:]) if directory.name.startswith("song") and directory.name[4:].isdigit() else 1
-    item = Item(None, index, plan.request.seed, plan.request, directory, quality, steps_for(quality, req), req.get("engine", "auto"))
-    item.plan, item.codec, item.truncated = plan, codec, truncated
-    item.semantic_timing = previous.get("timing", {}) if "tokens.json" in previous else {}
-    with MODEL_LOCK:
-        item.engine = choose_engine(item.engine, pipeline(), len(codec), quality)
-    PIPELINE.add([item])
-    emit(event="started", job=directory.parent.name, output=str(directory.parent), songs=[{"index": index, "seed": item.seed, "path": item.path}])
-    log(f"Queued {item.label} for {quality} synthesis ({item.steps} steps, engine {item.engine}): about {len(codec) / 25:.0f} s of audio")
-    item.set_stage("synth", "waiting", engine=item.engine)
-    PIPELINE.synth.put(item)
+    song = Song(directory.parent.name, index, plan.request.seed, plan.request, directory, quality, steps_for(quality, req), 9000)
+    song.plan, song.codec, song.truncated = plan, codec, truncated
+    song.timing = previous.get("timing", {}) if "frames" in previous else {}
+    song.decide_engine()
+    song.state = SYNTH_WAIT
+    emit(event="started", job=directory.parent.name, output=str(directory.parent),
+         songs=[{"index": index, "seed": song.seed, "path": song.path, "priority": song.priority}])
+    log(f"Queued {song.label} for {quality} synthesis ({song.steps} steps, priority {song.priority}): about {len(codec) / 25:.0f} s of audio")
+    SCHED.submit([song])
 
 
 def submit(req):
@@ -815,7 +802,7 @@ def footprint_mb():
 def release(deep=False):
     """Free GPU/engine memory held between jobs: MLX weights and cache, ANE weight surfaces and
     program mappings, the VAE and the MPS cache. deep=True also drops the model (lean reload ~1 s)
-    and the compiled ANE programs. Call under MODEL_LOCK with the pipeline empty."""
+    and the compiled ANE programs. Call under MODEL_LOCK with no live songs."""
     global PIPE
     import gc, torch
     before = footprint_mb()
@@ -858,7 +845,7 @@ def idle_watch():
         time.sleep(30)
         if PIPE is not None and PIPE._model is not None and time.time() - LAST_ACTIVE[0] > IDLE_UNLOAD_S:
             with MODEL_LOCK:
-                if PIPELINE.live or time.time() - LAST_ACTIVE[0] <= IDLE_UNLOAD_S or PIPE._model is None:
+                if SCHED.songs or time.time() - LAST_ACTIVE[0] <= IDLE_UNLOAD_S or PIPE._model is None:
                     continue
                 with TORCH_LOCK:
                     release(deep=True)
@@ -867,9 +854,8 @@ def idle_watch():
 # ── Main loop ────────────────────────────────────────────────────────────────
 
 def main():
-    emit(event="ready", root=str(ROOT), concurrent=CONCURRENT)
-    for target in (tokens_stage, ane_lane, gpu_lane, decode_stage, idle_watch):
-        threading.Thread(target=target, name=target.__name__, daemon=True).start()
+    emit(event="ready", root=str(ROOT), concurrent=CONCURRENT, max_batch=MAX_BATCH)
+    threading.Thread(target=idle_watch, name="idle_watch", daemon=True).start()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -882,15 +868,15 @@ def main():
         if cmd == "ping":
             emit(event="pong")
         elif cmd == "quit":
-            PIPELINE.stop(); break
+            SCHED.stop(); break
         elif cmd == "stop":
-            PIPELINE.stop()
+            SCHED.stop()
         elif cmd == "cancel":
-            item = PIPELINE.live.get(str(Path(req.get("path", "")))) or PIPELINE.live.get(str(Path(req.get("path", "")) / "audio.flac"))
-            if item is None:
+            song = SCHED.find(str(Path(req.get("path", ""))))
+            if song is None:
                 emit(event="error", message="not queued")
             else:
-                PIPELINE.cancel(item)
+                SCHED.cancel(song)
         elif cmd in ("generate", "render"):
             threading.Thread(target=submit, args=(req,), daemon=True).start()     # never block the command loop on a model load
         else:

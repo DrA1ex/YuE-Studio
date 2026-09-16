@@ -195,6 +195,7 @@ struct Song: Identifiable, Equatable {
     var fraction: Double? = nil                  // stage progress, when known
     var gflops: Double? = nil                    // rough throughput of the current stage, GFLOP/s
     var engine = ""                              // synthesis engine (ane / mlx / torch)
+    var priority = 0                             // scheduling order (1 = first added); 0 = unknown
     var directory: URL { URL(fileURLWithPath: path).deletingLastPathComponent() }
     var inFlight: Bool { [.queued, .planning, .tokens, .synth, .decode].contains(status) }
     var runLabel: String {
@@ -327,11 +328,12 @@ final class Backend: ObservableObject {
                 let run = URL(fileURLWithPath: obj["output"] as? String ?? "").lastPathComponent
                 for entry in obj["songs"] as? [[String: Any]] ?? [] {
                     let path = entry["path"] as? String ?? ""
+                    let priority = entry["priority"] as? Int ?? 0
                     if let i = songs.firstIndex(where: { $0.path == path }) {
-                        songs[i].status = .queued; songs[i].detail = "queued"; songs[i].fraction = nil
+                        songs[i].status = .queued; songs[i].detail = "queued"; songs[i].fraction = nil; songs[i].priority = priority
                     } else {
                         songs.append(Song(run: run, index: entry["index"] as? Int ?? 0, path: path, score: "", seconds: 0,
-                                          seed: entry["seed"] as? Int ?? 0, truncated: false, status: .queued, detail: "queued"))
+                                          seed: entry["seed"] as? Int ?? 0, truncated: false, status: .queued, detail: "queued", priority: priority))
                     }
                 }
                 sortSongs(); updateBusy()
@@ -339,6 +341,7 @@ final class Backend: ObservableObject {
                 guard let i = songs.firstIndex(where: { $0.path == path }) else { break }
                 let detail = obj["detail"] as? String ?? ""
                 if let engine = obj["engine"] as? String { songs[i].engine = engine }
+                if let p = obj["priority"] as? Int { songs[i].priority = p }
                 songs[i].gflops = nil
                 switch obj["stage"] as? String ?? "" {
                 case "queued": songs[i].status = .queued; songs[i].detail = detail; songs[i].fraction = nil
@@ -627,7 +630,7 @@ struct ContentView: View {
                 case .failed:
                     Text("Song \(song.index) · seed \(song.seed) · failed").bold().foregroundStyle(.red)
                 default:
-                    Text("Song \(song.index) · seed \(song.seed) · \(song.runLabel)" + (song.quality == "draft" ? " · draft" : "")).bold().foregroundStyle(.secondary)
+                    Text((song.priority > 0 ? "#\(song.priority) · " : "") + "Song \(song.index) · seed \(song.seed) · \(song.runLabel)" + (song.quality == "draft" ? " · draft" : "")).bold().foregroundStyle(.secondary)
                 }
                 if song.inFlight {
                     StageTrack(progress: song.trackProgress)

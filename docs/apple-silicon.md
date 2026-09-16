@@ -208,52 +208,44 @@ falls back to MLX on a refusal. Accuracy is unchanged (velocity 0.9997 on the
 20 s song, 0.9995 on the 4-minute song; latents 0.9999); the batch-axis layout
 roughly doubles the op count, so the 4-minute bucket compiles in ~47 s.
 
-**Pipelined worker.** `tools/yue2_worker.py` runs three stages on their own
-threads behind a queue: tokens (GPU: score and song tokens, all songs of a job in
-one batch), synthesis (Neural Engine at full quality, GPU/MLX for drafts) and
-decode (GPU: VAE). They overlap: the GPU generates the next job's tokens while
-the Neural Engine solves this one, and latents are decoded as they arrive.
+**The scheduler.** `tools/yue2_worker.py` treats songs as processes and the
+GPU and the Neural Engine as resources. Each song has a priority (its arrival
+number) and a state: queued, planning, tokenizing, waiting for synthesis,
+synthesizing, waiting to render, rendering, done. One function,
+`Scheduler.schedule`, runs after every event and assigns resources by priority:
+
+- *Neural Engine*: the highest-priority song that wants it (full quality, length
+  the compiler accepts), including a song already solving on the GPU, which
+  moves across at its next step boundary when it outranks everything waiting
+  (`nar_switch.synthesize_switchable`: same noise and schedule, the state is
+  handed over; the prefix K/V stays on the GPU until the Neural Engine solver
+  is built from it). While a song solves on the Neural Engine the next Neural
+  Engine song's program compiles in the background.
+- *GPU, tokenizing*: the highest-priority queued song, taking every other queued
+  song of the same kind (same planning mode) along in one batch of up to
+  `YUE2_MAX_BATCH` (4 on 24 GB+, else 2), across jobs: one row or four cost the
+  same per step. Rows have their own token budgets and leave the batch the
+  moment they end (`generate_tokens_batched(on_row_done=..., limits=...)`). A
+  queued song that outranks the song synthesizing on the GPU starts its batch
+  anyway, and the synthesis pauses (preemption).
+- *GPU, synthesis*: drafts, and full-quality songs while the Neural Engine is
+  busy; only when no batch runs and no queued song outranks the candidate. It
+  pauses between steps whenever tokenizing, rendering or the Neural Engine
+  song's prefix prefill are on the GPU (MLX's long kernels would starve them:
+  25x slower token steps measured).
+- *Rendering*: always admitted; its tiles interleave with token steps on the
+  device lock.
+
 PyTorch's Metal backend cannot be driven from two threads at once (it encodes
 into one command buffer and asserts), so every PyTorch GPU section takes turns
 on `locks.FairLock`: each token step, the synthesis prefill and weight copies,
 each decode tile. The Neural Engine and MLX solvers run outside the lock, which
-is where the overlap comes from; a `threading.Lock` would let the token loop
-starve the others. Below 24 GB the stages run one at a time (`YUE2_PIPELINE=1`
-overrides). Songs enter the queue with a `started` event and report `stage`
-(`queued`, `planning`, `tokens`, `synth`, `decode`, `ready`, `failed`, `cancelled`) and
-per-song `progress`; `idle` fires when the last queued song finishes. Tokens are
-written to the song folder (`semantic.npy`, plan files, `tokens.json`) as soon
-as they exist, so a song whose synthesis never ran can be synthesized later with
-the `render` command (the app lists such songs as "tokens only").
-
-**Early release from the token batch.** All songs of a job are tokenized in one
-batch (one or two rows cost the same per step), but a row that emits its end
-token is handed to synthesis at once (`generate_tokens_batched(on_row_done=...)`)
-while the batch continues for the longer songs, so the first song of a pair is
-already on the Neural Engine while the second is still tokenizing.
-
-**Two synthesis lanes.** The synthesis queue feeds a Neural Engine lane (full-quality
-songs) and a GPU lane (drafts, songs the Neural Engine cannot compile). When the
-GPU has nothing else to do (no tokenizing, no rendering, nothing queued for them)
-the GPU lane also takes the next full-quality song that would otherwise wait: it
-starts on MLX while its Neural Engine program compiles in the background, and
-moves to the Neural Engine at the next step boundary once that is free
-(`nar_switch.synthesize_switchable`: same noise and schedule, the state is
-handed over, the prefix K/V cache stays on the GPU until the Neural Engine solver
-is built from it). The Neural Engine lane waits for a claimed hand-off rather
-than starting another song, so the GPU is freed for rendering. While still on
-the GPU the song pauses between steps whenever tokenizing or rendering starts
-(MLX's long kernels starve the token loop: 25x slower steps measured), resuming
-when they finish or moving to the Neural Engine if it frees up meanwhile. Such
-a song is recorded with `nar_engine: mlx+ane`.
-
-**Instrumental songs.** Tags alone ("instrumental, no vocals") do not stop the
-singer: the token model follows the planned score, which has a Vocal voice. The
-app's "Instrumental (no vocals)" switch (worker `instrumental: true`) adds the
-no-vocal tags, keeps only the section markers of the lyrics, plans the score as
-usual and then re-plans from that score with every Vocal bar replaced by rests
-(`yue2.instrumental.silence_vocals`, chords kept), so the tokens carry no sung
-melody. Planning is forced on for it. Verified by ear on a 30 s draft.
+is where the overlap comes from. Below 24 GB the resources take turns
+(`YUE2_PIPELINE=1` overrides). Songs enter with a `started` event and report
+`stage` (with `priority`) and per-song `progress`; `idle` fires when the last
+song finishes. Tokens are written to the song folder as soon as they exist, so
+a song whose synthesis never ran can be synthesized later with the `render`
+command (the app lists such songs as "tokens only").
 
 **Memory between jobs.** When the queue drains the worker releases its
 working memory (MLX weights and cache, ANE weight surfaces and program
