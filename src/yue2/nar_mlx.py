@@ -50,6 +50,12 @@ class MLXWeights:
         for i in range(len(model.model.layers)):
             # From the module when loaded, else read from the checkpoint (lean model).
             layer = {name: _to_mx(t) for name, t in nar_layer_state(model, i).items()}
+            # Fused projections: one matmul for q/k/v and one for gate/up (fewer, larger kernels;
+            # each saves a read of the input activation).
+            layer["qkv"] = mx.concatenate([layer["q"], layer["k"], layer["v"]], axis=0)
+            layer["gate_up"] = mx.concatenate([layer["gate"], layer["up"]], axis=0)
+            for name in ("q", "k", "v", "gate", "up"):
+                del layer[name]
             mx.eval(*layer.values())
             self.layers.append(layer)
         mx.eval(self.pe, self.final_norm)
@@ -65,6 +71,13 @@ def _linear(x, w, b=None):
 
 def _rms(x, w, eps):
     return mx.fast.rms_norm(x, w, eps)
+
+
+@mx.compile
+def _swiglu(gu):
+    """SiLU(gate) * up on the fused gate/up projection, as one kernel."""
+    g, u = mx.split(gu, 2, axis=-1)
+    return g * mx.sigmoid(g) * u
 
 
 class MLXVelocity:
@@ -86,9 +99,8 @@ class MLXVelocity:
         mx.eval(self.cos, self.sin, self.pos_emb, *[t for kv in self.cache for t in kv])
 
     def _rotary(self, x):
-        half = x.shape[-1] // 2
-        x1, x2 = x[..., :half], x[..., half:]
-        return mx.concatenate([x1 * self.cos - x2 * self.sin, x2 * self.cos + x1 * self.sin], axis=-1)
+        # Same "rotate half" convention as the model, fused: rotates by position ar_length + i.
+        return mx.fast.rope(x, self.w.HD, traditional=False, base=self.w.theta, scale=1.0, offset=self.ar_length)
 
     def _time_embedding(self, raw_t):
         w = self.w
@@ -109,20 +121,20 @@ class MLXVelocity:
         x_nar = mx.pad(state, ((1, 1), (0, 0)))
         x = _linear(x_nar, w.vae2llm[0], w.vae2llm[1]) + self._time_embedding(raw_t) + self.pos_emb
         scale = w.HD ** -0.5
+        q_end, k_end = w.H * w.HD, (w.H + w.KV) * w.HD
         for layer, (ar_k, ar_v) in zip(w.layers, self.cache):
             h = _rms(x, layer["in_norm"], w.eps)
-            q = _rms(_linear(h, layer["q"]).reshape(T, w.H, w.HD), layer["q_norm"], w.eps)
-            k = _rms(_linear(h, layer["k"]).reshape(T, w.KV, w.HD), layer["k_norm"], w.eps)
-            v = _linear(h, layer["v"]).reshape(T, w.KV, w.HD)
-            q, k = self._rotary(q), self._rotary(k)
-            qh = mx.transpose(q, (1, 0, 2))[None]                          # [1, H, T, HD]
-            kh = mx.concatenate([ar_k, mx.transpose(k, (1, 0, 2))[None]], axis=2)
+            qkv = _linear(h, layer["qkv"])                                    # [T, (H + 2 KV) HD]
+            q = _rms(qkv[:, :q_end].reshape(T, w.H, w.HD), layer["q_norm"], w.eps)
+            k = _rms(qkv[:, q_end:k_end].reshape(T, w.KV, w.HD), layer["k_norm"], w.eps)
+            v = qkv[:, k_end:].reshape(T, w.KV, w.HD)
+            qh = self._rotary(mx.transpose(q, (1, 0, 2))[None])              # [1, H, T, HD]
+            kh = mx.concatenate([ar_k, self._rotary(mx.transpose(k, (1, 0, 2))[None])], axis=2)
             vh = mx.concatenate([ar_v, mx.transpose(v, (1, 0, 2))[None]], axis=2)
             a = mx.fast.scaled_dot_product_attention(qh, kh, vh, scale=scale)
             x = x + _linear(mx.transpose(a[0], (1, 0, 2)).reshape(T, w.H * w.HD), layer["o"])
             m = _rms(x, layer["mlp_norm"], w.eps)
-            g = _linear(m, layer["gate"])
-            x = x + _linear(g * mx.sigmoid(g) * _linear(m, layer["up"]), layer["down"])
+            x = x + _linear(_swiglu(_linear(m, layer["gate_up"])), layer["down"])
         out = _linear(_rms(x, w.final_norm, w.eps), w.llm2vae[0], w.llm2vae[1])
         return out[1:-1]
 

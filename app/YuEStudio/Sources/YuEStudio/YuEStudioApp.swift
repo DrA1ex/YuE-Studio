@@ -342,18 +342,14 @@ final class Backend: ObservableObject {
                 let detail = obj["detail"] as? String ?? ""
                 if let engine = obj["engine"] as? String { songs[i].engine = engine }
                 if let p = obj["priority"] as? Int { songs[i].priority = p }
-                songs[i].gflops = nil
-                switch obj["stage"] as? String ?? "" {
-                case "queued": songs[i].status = .queued; songs[i].detail = detail; songs[i].fraction = nil
-                case "planning": songs[i].status = .planning; songs[i].detail = detail; songs[i].fraction = nil
-                case "tokens": songs[i].status = .tokens; songs[i].detail = detail; songs[i].fraction = nil
-                case "synth": songs[i].status = .synth; songs[i].detail = detail; songs[i].fraction = nil
-                case "decode": songs[i].status = .decode; songs[i].detail = detail; songs[i].fraction = nil
-                case "ready": songs[i].status = .ready; songs[i].detail = ""; songs[i].fraction = nil
-                case "failed": songs[i].status = .failed; songs[i].detail = detail; songs[i].fraction = nil
-                case "cancelled": songs.remove(at: i); rescan()          // back to whatever is on disk (audio, tokens, or nothing)
-                default: break
-                }
+                let stages: [String: Song.Status] = ["queued": .queued, "planning": .planning, "tokens": .tokens, "synth": .synth,
+                                                     "decode": .decode, "ready": .ready, "failed": .failed]
+                let stage = obj["stage"] as? String ?? ""
+                if stage == "cancelled" { songs.remove(at: i); rescan(); updateBusy(); break }   // back to whatever is on disk
+                guard let status = stages[stage] else { break }
+                if status != songs[i].status { songs[i].fraction = nil; songs[i].gflops = nil }    // a new stage starts from zero
+                songs[i].status = status
+                songs[i].detail = status == .ready ? "" : detail
                 updateBusy()
             case "progress":
                 guard let i = songs.firstIndex(where: { $0.path == path }) else { break }
