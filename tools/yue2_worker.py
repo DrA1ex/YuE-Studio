@@ -809,7 +809,9 @@ def submit_render(req):
     import numpy as np
     from yue2.pipeline import SymbolicPlan
     directory = Path(req["path"])
-    if directory.is_file():
+    if not directory.is_dir():
+        # The app addresses songs by their audio.flac path even when the file
+        # doesn't exist yet (a stalled song) — strip to the directory either way.
         directory = directory.parent
     if SCHED.find(str(directory / "audio.flac")) is not None:
         emit(event="error", message=f"{directory.name} is already queued"); return
@@ -840,6 +842,9 @@ def submit(req):
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)
         log(f"Error: {type(exc).__name__}: {exc}"); emit(event="error", message=f"{type(exc).__name__}: {exc}")
+        # The app marks the row queued before sending — flip it to failed so a
+        # submit that never reached the scheduler doesn't sit on "Queued" forever.
+        emit(event="failed", path=req.get("path", ""), message=f"{type(exc).__name__}: {exc}")
 
 
 # ── Memory ───────────────────────────────────────────────────────────────────
