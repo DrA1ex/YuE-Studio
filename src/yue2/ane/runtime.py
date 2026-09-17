@@ -66,6 +66,8 @@ class Lib:
         lib.ane_surface_free.argtypes = [ctypes.c_void_p]
         lib.ane_program_load.restype = ctypes.c_void_p
         lib.ane_program_load.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_double), ctypes.c_char_p, ctypes.c_int]
+        lib.ane_program_compile.restype = ctypes.c_void_p
+        lib.ane_program_compile.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_double), ctypes.c_char_p, ctypes.c_int]
         lib.ane_program_eval.restype = ctypes.c_int
         lib.ane_program_eval.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_int,
                                          ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
@@ -116,18 +118,19 @@ def input_names(directory):
 
 
 class Program:
-    def __init__(self, directory):
+    def __init__(self, directory, load=True):
+        """Compile the program; load=False leaves it unloaded (no engine mappings) until reload()."""
         self.lib = Lib.get().lib
         self.inputs = input_names(directory)
         err = ctypes.create_string_buffer(4096)
         seconds = ctypes.c_double(0)
         if os.environ.get("YUE2_ANE_FAIL_COMPILE"):          # test hook: behave like a compiler rejection
             raise RuntimeError("compile: simulated ANECCompile() FAILED")
-        self.handle = self.lib.ane_program_load(str(directory).encode(), ctypes.byref(seconds), err, len(err))
+        self.handle = self.lib.ane_program_compile(str(directory).encode(), 1 if load else 0, ctypes.byref(seconds), err, len(err))
         if not self.handle:
             raise RuntimeError(err.value.decode(errors="replace"))
         self.compile_seconds = seconds.value
-        self.resident = True
+        self.resident = bool(load)
 
     def __call__(self, inputs, outputs):
         """inputs: {name: Surface} bound in the program's declared order; outputs: [Surface]."""
@@ -173,15 +176,12 @@ class LayerPrograms:
         return CACHE / self.identity / MIL_VERSION / f"S{S}_P{P}{tile}_g{LAYERS_PER_PROGRAM}" / "shared"
 
     def precompile(self, S, P, on_progress=None):
-        """Compile a bucket's program in the background and leave it unloaded (no engine mappings)."""
+        """Compile a bucket's program in the background without loading it: a second program
+        mapped beside the running one overflows the engine's address window."""
         with self.lock:
             if (S, P) in self.loaded:
                 return
-            programs = self._build(S, P, on_progress)
-            for p in programs:
-                if p.resident:
-                    p.unload()
-            self.loaded[(S, P)] = programs
+            self.loaded[(S, P)] = self._build(S, P, on_progress, load=False)
 
     def ensure(self, S, P, on_progress=None):
         key = (S, P)
@@ -204,7 +204,7 @@ class LayerPrograms:
             self.loaded[key] = programs
             return programs
 
-    def _build(self, S, P, on_progress=None):
+    def _build(self, S, P, on_progress=None, load=True):
         cfg = self.model.config
         d = self.directory(S, P)
         gen_s = 0.0
@@ -214,7 +214,7 @@ class LayerPrograms:
                           KV=cfg.num_key_value_heads, HD=cfg.head_dim, eps=cfg.rms_norm_eps, qblk=QBLK, kchunk=KCHUNK,
                           weights_as_inputs=True)
             gen_s = time.perf_counter() - t0
-        program = Program(d)
+        program = Program(d, load=load)
         program.layers = LAYERS_PER_PROGRAM
         if on_progress is not None:
             on_progress(1, 1)
@@ -358,7 +358,15 @@ class ANEVelocity:
                 pk.write(hk); pv.write(hv)
                 inputs[f"pk{j}"], inputs[f"pv{j}"] = pk, pv
             self.weights.bind(first, count, inputs)
-            program(inputs, [self.x[(calls + 1) % 2]])
+            try:
+                program(inputs, [self.x[(calls + 1) % 2]])
+            except RuntimeError as exc:
+                if "Inference error" not in str(exc):
+                    raise
+                # A transient engine failure (its address window was briefly oversubscribed): the
+                # inputs are intact, so reload the program and run this call again.
+                program.unload(); program.reload()
+                program(inputs, [self.x[(calls + 1) % 2]])
             calls += 1
         self.layer_seconds.append(time.perf_counter() - t0)
         h = torch.from_numpy(self.x[calls % 2].read((self.S, self.D)).astype(np.float32))[:self.S_real]

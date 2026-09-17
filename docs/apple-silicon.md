@@ -266,6 +266,17 @@ song finishes. Tokens are written to the song folder as soon as they exist, so
 a song whose synthesis never ran can be synthesized later with the `render`
 command (the app lists such songs as "tokens only").
 
+**Background compiles must not load.** The bridge's original load function
+compiled a program and loaded it into the engine (mapping its arena in the
+process's ~3.5 GiB address window) before `precompile` unloaded it again. With
+a long song's program resident next to the 2.8 GB of weight surfaces, that
+transient second mapping overflowed the window and the *running* inference
+failed ("Program Inference error", status 0x2) within seconds of "programs
+ready". `ane_program_compile(dir, do_load=0)` now compiles without loading;
+programs are loaded only by `ensure`, after the previous bucket is unloaded. A
+pass that still fails with an inference error is retried once after reloading
+the program (the solver state is on the CPU, so nothing is lost).
+
 **Memory between jobs.** When the queue drains the worker releases its
 working memory (MLX weights and cache, ANE weight surfaces and program
 mappings, the VAE, the MPS cache): about 11 GB -> 5 GB resident with the lean

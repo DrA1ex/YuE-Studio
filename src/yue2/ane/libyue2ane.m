@@ -50,7 +50,11 @@ void ane_surface_read(ane_surface *s, void *dst, size_t bytes) {
 }
 void ane_surface_free(ane_surface *s) { if (!s) return; s->wrapper = nil; CFRelease(s->surface); free(s); }
 
-ane_program *ane_program_load(const char *dir, double *compile_seconds, char *err, int errlen) {
+// Compile a program and, if do_load, load it into the engine (mapping its arena in the process's
+// ~3.5 GiB address window). Background compiles pass do_load=0 so a second big program is never
+// mapped beside the one that is running: that overflowed the window and failed the running
+// inference (status 0x2). Load later with ane_program_reload.
+ane_program *ane_program_compile(const char *dir, int do_load, double *compile_seconds, char *err, int errlen) {
     if (ensure(err, errlen)) return NULL;
     @autoreleasepool {
         NSString *d = [NSString stringWithUTF8String:dir];
@@ -83,13 +87,17 @@ ane_program *ane_program_load(const char *dir, double *compile_seconds, char *er
             seterr(err, errlen, e, "compile"); [fm removeItemAtPath:tmp error:nil]; return NULL;
         }
         if (compile_seconds) *compile_seconds = -[t0 timeIntervalSinceNow];
-        if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(model, @selector(loadWithQoS:options:error:), 21, @{}, &e)) {
+        if (do_load && !((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(model, @selector(loadWithQoS:options:error:), 21, @{}, &e)) {
             seterr(err, errlen, e, "load"); [fm removeItemAtPath:tmp error:nil]; return NULL;
         }
         ane_program *p = calloc(1, sizeof *p);
         p->model = model; p->tmp = tmp;
         return p;
     }
+}
+
+ane_program *ane_program_load(const char *dir, double *compile_seconds, char *err, int errlen) {
+    return ane_program_compile(dir, 1, compile_seconds, err, errlen);
 }
 
 int ane_program_eval(ane_program *p, ane_surface **ins, int n_in, ane_surface **outs, int n_out, char *err, int errlen) {
