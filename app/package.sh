@@ -8,7 +8,7 @@ APPDIR="$ROOT/app/YuEStudio"
 DIST="$ROOT/dist"
 APP="$DIST/YuE Studio.app"
 UV="${UV:-$(command -v uv)}"
-VERSION="$(date +%Y%m%d)-$(cat "$ROOT"/src/yue2/*.py "$ROOT"/src/yue2/ane/*.py "$ROOT"/tools/yue2_worker.py "$ROOT"/pyproject.toml | shasum | cut -c1-8)"
+VERSION="$(date +%Y%m%d)-$(cat "$ROOT"/src/yue2/*.py "$ROOT"/src/yue2/ane/*.py "$ROOT"/tools/yue2_worker.py "$ROOT"/tools/transcribe_sheetsage.py "$ROOT"/tools/download_models.py "$ROOT"/pyproject.toml | shasum | cut -c1-8)"
 
 echo "== building Neural Engine library"
 (cd "$ROOT/src/yue2/ane" && clang -O2 -fobjc-arc -dynamiclib libyue2ane.m -o libyue2ane.dylib -framework Foundation -framework IOSurface)
@@ -31,7 +31,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSArchitecturePriority</key><array><string>arm64</string></array>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSHumanReadableCopyright</key><string>YuE2 model: m-a-p (Apache-2.0 code, model licence applies)</string>
+  <key>NSHumanReadableCopyright</key><string>YuE2 model: m-a-p (Apache-2.0 code, model licence applies). SheetSage2 weights: CC BY-NC 4.0.</string>
 </dict></plist>
 PLIST
 
@@ -42,7 +42,7 @@ rsync -a --exclude '__pycache__' --exclude '*.pyc' \
   "$ROOT/pyproject.toml" "$ROOT/README.md" "$ROOT/LICENSE" "$ROOT/MODEL_LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$ROOT/MANIFEST.in" "$ROOT/licenses" \
   "$ROOT/src" "$ROOT/examples" "$APP/Contents/Resources/payload/yue2-src/"
 mkdir -p "$APP/Contents/Resources/payload/yue2-src/tools"
-cp "$ROOT/tools/yue2_worker.py" "$ROOT/tools/download_models.py" "$APP/Contents/Resources/payload/yue2-src/tools/"
+cp "$ROOT/tools/yue2_worker.py" "$ROOT/tools/download_models.py" "$ROOT/tools/transcribe_sheetsage.py" "$APP/Contents/Resources/payload/yue2-src/tools/"
 
 # Signing. Ad hoc by default; SIGN_IDENTITY='Developer ID Application: Name (TEAM)' signs for distribution
 # with the hardened runtime and secure timestamps, nested binaries first (notarization requires all of them).

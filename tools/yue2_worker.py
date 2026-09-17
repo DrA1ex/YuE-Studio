@@ -18,6 +18,8 @@ Requests: {"cmd": "generate", "style", "lyrics", "cot": "full|melody|off", "seed
            "max_tokens", "abc": str|null, "quality": "draft|full", "draft_steps", "instrumental": bool}
           {"cmd": "render", "path": song directory or its audio.flac, "quality": "full|draft"}
           {"cmd": "cancel", "path"}   {"cmd": "stop"}   {"cmd": "ping"}   {"cmd": "quit"}
+          {"cmd": "transcribe", "id", "audio", "task": "melody-full|melody-vocal", "offline": bool}
+          {"cmd": "transcribe_cancel", "id"}
 Events:   {"event": "ready"}   {"event": "log", "message"}   {"event": "pong"}   {"event": "error", "message"}
           {"event": "started", "job", "output", "songs": [{"index", "seed", "path", "priority"}]}
           {"event": "stage", "path", "priority", "stage": "queued|planning|tokens|synth|decode|ready|failed|cancelled",
@@ -25,8 +27,11 @@ Events:   {"event": "ready"}   {"event": "log", "message"}   {"event": "pong"}  
           {"event": "progress", "path", "fraction": 0-1, "detail", "gflops": rate}
           {"event": "song", "index", "path", "score", "seconds", "seed", "truncated", "quality", "steps", "engine"}
           {"event": "failed", "path", "message"}   {"event": "idle"}   (every song finished or was cancelled)
+          {"event": "transcribe", "id", "stage": "starting|progress|done|failed|cancelled",
+           "fraction", "detail", "abc", "warnings", "output", "message", "code"}   (keyed by the
+           request's client id, never by "path", so song-keyed handlers can't misapply it)
 """
-import datetime as dt, itertools, json, os, sys, threading, time, traceback
+import datetime as dt, itertools, json, os, subprocess, sys, threading, time, traceback
 from pathlib import Path
 os.environ.setdefault("TQDM_DISABLE", "1")          # coremltools progress bars would otherwise flood the app log
 import warnings
@@ -53,6 +58,10 @@ ANE_MAX_FRAMES = 12288    # MIL v7 compiles up to here (9216 x 14336 verified); 
 # and MLX solvers run outside it, which is what lets synthesis overlap token generation.
 from yue2.locks import FairLock
 TORCH_LOCK = FairLock()
+# SheetSage2 transcription runs as a subprocess in its own environment (its pins conflict with
+# ours) with its own Metal context, so TORCH_LOCK does not apply — only one at a time, though.
+TRANSCRIBE_LOCK = threading.Lock()
+TRANSCRIBE_PROC = [None]
 
 
 def emit(**event):
@@ -847,6 +856,80 @@ def submit(req):
         emit(event="failed", path=req.get("path", ""), message=f"{type(exc).__name__}: {exc}")
 
 
+# ── Transcription (SheetSage2) ───────────────────────────────────────────────
+
+def run_transcribe(req):
+    """Run SheetSage2 in its own environment and forward its JSON progress lines."""
+    rid = req.get("id", "")
+    if not TRANSCRIBE_LOCK.acquire(blocking=False):
+        emit(event="transcribe", id=rid, stage="failed", code="busy",
+             message="a transcription is already running")
+        return
+    try:
+        python = Path(os.environ.get("YUE2_SHEETSAGE_PYTHON")
+                      or ROOT / ".venv-sheetsage2" / "bin" / "python")
+        if not python.is_file():
+            emit(event="transcribe", id=rid, stage="failed", code="no_env",
+                 message="SheetSage2 environment not installed")
+            return
+        tool = Path(os.environ.get("YUE2_TRANSCRIBE_TOOL")
+                    or Path(__file__).with_name("transcribe_sheetsage.py"))
+        audio = Path(req.get("audio", ""))
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        out = OUTPUT_DIR / "transcriptions" / f"{audio.stem}-{stamp}"   # song rescans never look here
+        cmd = [str(python), "-u", str(tool), str(audio), "--output", str(out),
+               "--task", req.get("task", "melody-full"), "--device", "cpu", "--dtype", "fp32",
+               "--threads", str(min(8, os.cpu_count() or 4))]
+        if req.get("offline"):
+            cmd.append("--offline")
+        log(f"Transcribing '{audio.name}' with SheetSage2")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)   # stderr inherited
+        TRANSCRIBE_PROC[0] = proc
+        settled = False
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                log(line)
+                continue
+            if obj.get("stage") in ("done", "failed"):
+                settled = True
+            emit(event="transcribe", id=rid, **obj)
+        code = proc.wait()
+        if code < 0:                                  # killed by transcribe_cancel
+            emit(event="transcribe", id=rid, stage="cancelled")
+            log(f"Transcription of '{audio.name}' cancelled")
+        elif not settled:
+            emit(event="transcribe", id=rid, stage="failed", code="crash",
+                 message=f"transcriber exited with status {code}")
+    except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
+        emit(event="transcribe", id=rid, stage="failed", code="crash",
+             message=f"{type(exc).__name__}: {exc}")
+    finally:
+        TRANSCRIBE_PROC[0] = None
+        TRANSCRIBE_LOCK.release()
+
+
+def cancel_transcribe():
+    proc = TRANSCRIBE_PROC[0]
+    if proc is None:
+        emit(event="error", message="no transcription running")
+        return
+    proc.terminate()
+
+    def kill_after_grace(p=proc):
+        try:
+            p.wait(3)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+    threading.Thread(target=kill_after_grace, daemon=True).start()
+
+
 # ── Memory ───────────────────────────────────────────────────────────────────
 
 def footprint_mb():
@@ -943,6 +1026,10 @@ def main():
                 SCHED.cancel(song)
         elif cmd in ("generate", "render"):
             threading.Thread(target=submit, args=(req,), daemon=True).start()     # never block the command loop on a model load
+        elif cmd == "transcribe":
+            threading.Thread(target=run_transcribe, args=(req,), daemon=True).start()
+        elif cmd == "transcribe_cancel":
+            cancel_transcribe()
         else:
             emit(event="error", message=f"unknown command {cmd}")
 

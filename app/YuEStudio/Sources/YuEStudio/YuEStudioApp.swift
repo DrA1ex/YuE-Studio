@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import AppKit
+import UniformTypeIdentifiers
 
 // MARK: - Paths
 
@@ -32,10 +33,15 @@ struct Paths {
     }
     static var installedMarker: URL { support.appendingPathComponent("installed.json") }
     static var bundledVersion: String { (try? String(contentsOf: payload!.appendingPathComponent("version.txt"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "dev" }
+    // SheetSage2 transcription lives in a second environment (its pins conflict with YuE's).
+    static var sheetsageEnv: URL { support.appendingPathComponent("sheetsage-env") }
+    static var sheetsagePython: URL { packaged ? sheetsageEnv.appendingPathComponent("bin/python") : repoRoot.appendingPathComponent(".venv-sheetsage2/bin/python") }
+    static var sheetsageMarker: URL { support.appendingPathComponent("sheetsage-installed.json") }
     static var workerEnvironment: [String: String] {
         var env = ProcessInfo.processInfo.environment
         env["PYTHONUNBUFFERED"] = "1"; env["TQDM_DISABLE"] = "1"
         env["YUE2_OUTPUT_DIR"] = output.path; env["YUE2_ANE_CACHE"] = aneCache.path
+        env["YUE2_SHEETSAGE_PYTHON"] = sheetsagePython.path   // worker cwd differs between modes
         if packaged { env["HF_HOME"] = models.path; env["HF_HUB_DISABLE_TELEMETRY"] = "1" }
         env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
         return env
@@ -43,6 +49,49 @@ struct Paths {
 }
 
 // MARK: - Installer
+
+/// Runs a process streaming merged stdout+stderr: JSON lines go to onLine, everything else
+/// (noise-filtered, capped) to append. Throws on nonzero exit. Shared by both installers.
+@MainActor
+private func runStreaming(_ exe: String, _ args: [String], _ env: [String: String],
+                          register: (Process?) -> Void, append: @escaping @MainActor (String) -> Void,
+                          onLine: (@Sendable (String) -> Void)? = nil) async throws {
+    let p = Process(); p.executableURL = URL(fileURLWithPath: exe); p.arguments = args; p.environment = env
+    register(p)
+    let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
+    final class LineBuffer: @unchecked Sendable { var pending = "" }
+    let buffer = LineBuffer()                          // buffers partial lines between chunks
+    pipe.fileHandleForReading.readabilityHandler = { h in
+        buffer.pending += String(decoding: h.availableData, as: UTF8.self)
+        var lines: [String] = []
+        while let r = buffer.pending.firstIndex(where: { $0 == "\n" || $0 == "\r" }) {
+            let line = String(buffer.pending[..<r]).trimmingCharacters(in: .whitespaces)
+            buffer.pending = String(buffer.pending[buffer.pending.index(after: r)...])
+            if line.hasPrefix("{"), let onLine { onLine(line); continue }        // structured progress, not log
+            if !line.isEmpty && !line.contains("Fetching ") && !line.contains("it/s]") && !line.contains("not on your PATH") { lines.append(String(line.prefix(300))) }
+        }
+        if !lines.isEmpty { Task { @MainActor in for l in lines { append(l) } } }
+    }
+    try p.run()
+    await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in p.terminationHandler = { _ in c.resume() } }
+    pipe.fileHandleForReading.readabilityHandler = nil
+    register(nil)
+    if p.terminationStatus != 0 { throw NSError(domain: "YuEStudio", code: Int(p.terminationStatus), userInfo: [NSLocalizedDescriptionKey: "\(URL(fileURLWithPath: exe).lastPathComponent) exited with status \(p.terminationStatus)"]) }
+}
+
+/// Parses a download script's {"bytes","total","rate_mbps"} line into a fraction and human detail.
+private func downloadProgress(_ line: String) -> (fraction: Double, detail: String, bytes: Double, rate: Double)? {
+    guard line.hasPrefix("{"), let d = line.data(using: .utf8),
+          let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+          let bytes = o["bytes"] as? Double, let total = o["total"] as? Double, total > 0 else { return nil }
+    let rate = o["rate_mbps"] as? Double ?? 0
+    var remaining = ""
+    if rate > 1 {
+        let seconds = max(0, (total - bytes) / (rate * 1e6))
+        remaining = seconds < 60 ? " · under a minute left" : String(format: " · about %.0f min left", seconds / 60)
+    }
+    return (min(0.99, bytes / total), String(format: "%.2f of %.1f GB · %.0f MB/s%@", bytes / 1e9, total / 1e9, rate, remaining), bytes, rate)
+}
 
 @MainActor
 final class Installer: ObservableObject {
@@ -103,21 +152,12 @@ final class Installer: ObservableObject {
                 try await step(4) {
                     // The download script reports byte progress from the Hub client's own callbacks.
                     try await self.run(Paths.python.path, [Paths.src.appendingPathComponent("tools/download_models.py").path], env) { [weak self] line in
-                        guard line.hasPrefix("{"), let d = line.data(using: .utf8),
-                              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                              let bytes = o["bytes"] as? Double, let total = o["total"] as? Double, total > 0 else { return }
-                        let rate = o["rate_mbps"] as? Double ?? 0
-                        var remaining = ""
-                        if rate > 1 {
-                            let seconds = max(0, (total - bytes) / (rate * 1e6))
-                            remaining = seconds < 60 ? " · under a minute left" : String(format: " · about %.0f min left", seconds / 60)
-                        }
+                        guard let p = downloadProgress(line) else { return }
                         Task { @MainActor in
                             guard let self else { return }
-                            self.progress = min(0.99, bytes / total)
-                            self.detail = String(format: "%.2f of %.1f GB · %.0f MB/s%@", bytes / 1e9, total / 1e9, rate, remaining)
-                            if Date().timeIntervalSince(self.lastRateLog) > 15 && bytes > 0 {
-                                self.lastRateLog = Date(); self.append(String(format: "Downloaded %.2f GB at %.0f MB/s", bytes / 1e9, rate))
+                            self.progress = p.fraction; self.detail = p.detail
+                            if Date().timeIntervalSince(self.lastRateLog) > 15 && p.bytes > 0 {
+                                self.lastRateLog = Date(); self.append(String(format: "Downloaded %.2f GB at %.0f MB/s", p.bytes / 1e9, p.rate))
                             }
                         }
                     }
@@ -142,27 +182,7 @@ final class Installer: ObservableObject {
     }
 
     private func run(_ exe: String, _ args: [String], _ env: [String: String], onLine: (@Sendable (String) -> Void)? = nil) async throws {
-        let p = Process(); p.executableURL = URL(fileURLWithPath: exe); p.arguments = args; p.environment = env
-        running = p
-        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
-        final class LineBuffer: @unchecked Sendable { var pending = "" }
-        let buffer = LineBuffer()                          // buffers partial lines between chunks
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
-            buffer.pending += String(decoding: h.availableData, as: UTF8.self)
-            var lines: [String] = []
-            while let r = buffer.pending.firstIndex(where: { $0 == "\n" || $0 == "\r" }) {
-                let line = String(buffer.pending[..<r]).trimmingCharacters(in: .whitespaces)
-                buffer.pending = String(buffer.pending[buffer.pending.index(after: r)...])
-                if line.hasPrefix("{"), let onLine { onLine(line); continue }        // structured progress, not log
-                if !line.isEmpty && !line.contains("Fetching ") && !line.contains("it/s]") && !line.contains("not on your PATH") { lines.append(String(line.prefix(300))) }
-            }
-            if !lines.isEmpty { Task { @MainActor in for l in lines { self?.append(l) } } }
-        }
-        try p.run()
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in p.terminationHandler = { _ in c.resume() } }
-        pipe.fileHandleForReading.readabilityHandler = nil
-        running = nil
-        if p.terminationStatus != 0 { throw NSError(domain: "YuEStudio", code: Int(p.terminationStatus), userInfo: [NSLocalizedDescriptionKey: "\(URL(fileURLWithPath: exe).lastPathComponent) exited with status \(p.terminationStatus)"]) }
+        try await runStreaming(exe, args, env, register: { running = $0 }, append: { [weak self] in self?.append($0) }, onLine: onLine)
     }
 
     nonisolated static func directorySize(_ url: URL) -> Int64 {
@@ -172,6 +192,105 @@ final class Installer: ObservableObject {
             if let v = try? f.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]), v.isRegularFile == true { total += Int64(v.fileSize ?? 0) }
         }
         return total
+    }
+}
+
+/// On-demand installer for the SheetSage2 transcription environment: its pins (torch 2.8,
+/// transformers 4.45, numpy 1.24) conflict with the YuE environment, so it gets its own venv
+/// and downloads only when the user first asks for a transcription.
+@MainActor
+final class SheetSageInstaller: ObservableObject {
+    enum State: Equatable { case unknown, needed, running, ready, failed(String) }
+    struct Step: Identifiable { let id: Int; let title: String; var done = false }
+    static let recipe = "1"      // bump when the venv recipe or pins change to force a reinstall
+    @Published var state: State = .unknown
+    @Published var steps: [Step] = [Step(id: 0, title: "Install Python 3.11"), Step(id: 1, title: "Download SheetSage2 (about 2 GB)"),
+                                     Step(id: 2, title: "Create environment"), Step(id: 3, title: "Install PyTorch"),
+                                     Step(id: 4, title: "Install SheetSage2 packages"), Step(id: 5, title: "Finish")]
+    @Published var current = 0
+    @Published var progress = 0.0
+    @Published var detail = ""
+    @Published var log: [LogLine] = []
+    private var task: Task<Void, Never>?
+    private var running: Process?
+    private var lastRateLog = Date.distantPast
+
+    func cancel() { running?.terminate(); task?.cancel(); if state == .running { state = .needed } }
+
+    func check() {
+        let fm = FileManager.default
+        guard Paths.packaged else { state = fm.fileExists(atPath: Paths.sheetsagePython.path) ? .ready : .needed; return }
+        let marker = (try? JSONSerialization.jsonObject(with: Data(contentsOf: Paths.sheetsageMarker)) as? [String: String])?["recipe"]
+        let modelPresent = fm.fileExists(atPath: Paths.models.appendingPathComponent("hub/models--m-a-p--SheetSage2").path)
+        state = (marker == Self.recipe && fm.fileExists(atPath: Paths.sheetsagePython.path) && modelPresent) ? .ready : .needed
+    }
+
+    func append(_ message: String) {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+        log.append(LogLine(time: f.string(from: Date()), message: message))
+    }
+
+    func install() {
+        guard let payload = Paths.payload else { return }   // repo mode installs by hand (docs/covers.md)
+        state = .running; progress = 0; current = 0
+        for i in steps.indices { steps[i].done = false }
+        let uv = payload.appendingPathComponent("uv").path
+        let support = Paths.support
+        let env: [String: String] = ["UV_PYTHON_INSTALL_DIR": support.appendingPathComponent("python").path,
+                                     "UV_CACHE_DIR": support.appendingPathComponent("uv-cache").path,
+                                     "HF_HOME": Paths.models.path, "HF_HUB_DISABLE_TELEMETRY": "1",
+                                     "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": NSHomeDirectory()]
+        task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await step(0) { try await self.run(uv, ["python", "install", "3.11"], env) }
+                try await step(1) {
+                    // The main env is guaranteed installed by now; its download script takes repo args.
+                    try await self.run(Paths.python.path, [Paths.src.appendingPathComponent("tools/download_models.py").path,
+                                                          "m-a-p/SheetSage2", "m-a-p/MERT-v2-FullSong"], env) { [weak self] line in
+                        guard let p = downloadProgress(line) else { return }
+                        Task { @MainActor in
+                            guard let self else { return }
+                            self.progress = p.fraction; self.detail = p.detail
+                            if Date().timeIntervalSince(self.lastRateLog) > 15 && p.bytes > 0 {
+                                self.lastRateLog = Date(); self.append(String(format: "Downloaded %.2f GB at %.0f MB/s", p.bytes / 1e9, p.rate))
+                            }
+                        }
+                    }
+                }
+                try await step(2) { try await self.run(uv, ["venv", Paths.sheetsageEnv.path, "--python", "3.11", "--clear"], env) }
+                // Plain PyPI wheels: on macOS these are the CPU/MPS builds (covers.md's cu126 index is for Linux).
+                try await step(3) { try await self.run(uv, ["pip", "install", "--python", Paths.sheetsagePython.path,
+                                                            "torch==2.8.0", "torchaudio==2.8.0"], env) }
+                try await step(4) {
+                    let snapshots = Paths.models.appendingPathComponent("hub/models--m-a-p--SheetSage2/snapshots")
+                    guard let snapshot = (try? FileManager.default.contentsOfDirectory(at: snapshots, includingPropertiesForKeys: nil))?.first else {
+                        throw NSError(domain: "YuEStudio", code: 1, userInfo: [NSLocalizedDescriptionKey: "SheetSage2 snapshot not found after download"])
+                    }
+                    try await self.run(uv, ["pip", "install", "--python", Paths.sheetsagePython.path,
+                                            "-r", snapshot.appendingPathComponent("requirements.txt").path, "soundfile"], env)
+                }
+                try await step(5) {
+                    try? FileManager.default.removeItem(at: support.appendingPathComponent("uv-cache"))
+                    let data = try JSONSerialization.data(withJSONObject: ["recipe": Self.recipe])
+                    try data.write(to: Paths.sheetsageMarker)
+                }
+                state = .ready
+            } catch {
+                append("Install failed: \(error.localizedDescription)")
+                state = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func step(_ i: Int, _ body: () async throws -> Void) async throws {
+        current = i; detail = ""; append("Step \(i + 1): \(steps[i].title)")
+        try await body()
+        steps[i].done = true; progress = Double(i + 1) / Double(steps.count)
+    }
+
+    private func run(_ exe: String, _ args: [String], _ env: [String: String], onLine: (@Sendable (String) -> Void)? = nil) async throws {
+        try await runStreaming(exe, args, env, register: { running = $0 }, append: { [weak self] in self?.append($0) }, onLine: onLine)
     }
 }
 
@@ -272,6 +391,15 @@ final class Backend: ObservableObject {
     @Published var busy = false                  // anything queued or in a stage
     @Published var connected = false
 
+    enum TranscribeState: Equatable { case idle, transcribing, review, failed(String, code: String) }
+    @Published var transcribe: TranscribeState = .idle
+    @Published var transcribeDetail = ""
+    @Published var transcribeFraction: Double?   // nil = indeterminate
+    @Published var transcribeABC = ""
+    @Published var transcribeWarnings: [String] = []
+    @Published var transcribeOutput = ""
+    private var transcribeID = ""
+
     var process: Process?
     private var stdin: FileHandle?
     private var buffer = Data()
@@ -300,7 +428,11 @@ final class Backend: ObservableObject {
             }
         }
         p.terminationHandler = { [weak self] _ in
-            Task { @MainActor in self?.connected = false; self?.process = nil; self?.append("Worker exited"); self?.rescan() }
+            Task { @MainActor in
+                guard let self else { return }
+                self.connected = false; self.process = nil; self.append("Worker exited"); self.rescan()
+                if self.transcribe == .transcribing { self.transcribe = .failed("the worker exited", code: "worker") }
+            }
         }
         do {
             try p.run()
@@ -369,6 +501,23 @@ final class Backend: ObservableObject {
                 updateBusy()
             case "idle": updateBusy(); rescan()
             case "error": append("Worker: \(obj["message"] as? String ?? "error")")
+            case "transcribe":
+                guard obj["id"] as? String == transcribeID else { break }   // stale run
+                switch obj["stage"] as? String ?? "" {
+                case "starting", "progress":
+                    transcribeDetail = obj["detail"] as? String ?? transcribeDetail
+                    transcribeFraction = obj["fraction"] as? Double ?? transcribeFraction
+                case "done":
+                    transcribeABC = obj["abc"] as? String ?? ""
+                    transcribeWarnings = obj["warnings"] as? [String] ?? []
+                    transcribeOutput = obj["output"] as? String ?? ""
+                    transcribe = .review
+                case "failed":
+                    transcribe = .failed(obj["message"] as? String ?? "transcription failed",
+                                         code: obj["code"] as? String ?? "")
+                case "cancelled": transcribe = .idle
+                default: break
+                }
             default: break
             }
         }
@@ -423,6 +572,14 @@ final class Backend: ObservableObject {
     }
 
     func cancel(_ song: Song) { send(["cmd": "cancel", "path": song.path]) }
+
+    func startTranscription(audio: URL, task: String) {
+        transcribeID = UUID().uuidString
+        transcribe = .transcribing; transcribeFraction = nil; transcribeDetail = "starting"
+        // Offline in packaged mode: the installer already downloaded the snapshot into HF_HOME.
+        send(["cmd": "transcribe", "id": transcribeID, "audio": audio.path, "task": task, "offline": Paths.packaged])
+    }
+    func cancelTranscription() { send(["cmd": "transcribe_cancel", "id": transcribeID]) }
     func stop() { send(["cmd": "stop"]); append("Stop sent") }
     func quit() { send(["cmd": "quit"]); process?.terminate() }
 }
@@ -486,8 +643,10 @@ struct ContentView: View {
     @AppStorage("maxSeconds") private var maxSeconds = 120.0
     @AppStorage("quality") private var quality = "draft"
     @AppStorage("instrumental") private var instrumental = false
-    @State private var abc = ""
+    @AppStorage("abc") private var abc = ""      // a transcribed score survives relaunch
     @State private var showScore: Song?
+    @StateObject private var sheetsage = SheetSageInstaller()
+    @State private var transcribeSource: PickedAudio?
     @AppStorage("logPanelHeight") private var logPanelHeight = 130.0
     @State private var logDragStart: Double? = nil
 
@@ -503,6 +662,20 @@ struct ContentView: View {
         .frame(minWidth: 960, minHeight: 640)
         .onAppear { backend.rescan(); if backend.process == nil { backend.start() } }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in backend.rescan() }
+        .sheet(item: $transcribeSource) { picked in
+            TranscribeSheetView(source: picked.url, abc: $abc, cot: $cot, sheetsage: sheetsage).environmentObject(backend)
+        }
+    }
+
+    private func pickRecording() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio]
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a recording to transcribe into a melody score"
+        if panel.runModal() == .OK, let url = panel.url {
+            backend.transcribe = .idle
+            transcribeSource = PickedAudio(url: url)
+        }
     }
 
     private var form: some View {
@@ -529,6 +702,11 @@ struct ContentView: View {
                 }
                 DisclosureGroup("ABC score (optional)") {
                     TextEditor(text: $abc).font(.system(.caption, design: .monospaced)).frame(height: 100)
+                    HStack {
+                        Button("Transcribe recording…") { pickRecording() }
+                            .disabled(!backend.connected || backend.transcribe == .transcribing)
+                        Text("SheetSage2 melody transcription for covers · weights CC BY-NC 4.0").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
             Section {
@@ -678,6 +856,142 @@ struct ContentView: View {
                 Button("Clear") { backend.log.removeAll() }.font(.caption)
             }.padding(.horizontal, 8).padding(.vertical, 4)
             LogTextView(lines: backend.log)
+        }
+    }
+}
+
+struct PickedAudio: Identifiable { let id = UUID(); let url: URL }
+
+/// Pick a recording → (install SheetSage2 on first use) → transcribe → review the melody ABC.
+/// "Use melody" fills the form's ABC field and forces Planning to "melody" for a cover.
+struct TranscribeSheetView: View {
+    let source: URL
+    @Binding var abc: String
+    @Binding var cot: String
+    @ObservedObject var sheetsage: SheetSageInstaller
+    @EnvironmentObject var backend: Backend
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("transcribeTask") private var task = "melody-full"
+    @State private var editedABC = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Transcribe \"\(source.lastPathComponent)\"").font(.headline)
+            content.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            bottomBar
+        }
+        .padding().frame(width: 640, height: 520)
+        .onAppear {
+            sheetsage.check()
+            if sheetsage.state == .ready && backend.connected { start() }
+        }
+        .onChange(of: sheetsage.state) { _, s in
+            if s == .ready && backend.transcribe == .idle && backend.connected { start() }
+        }
+        .onChange(of: backend.transcribe) { _, t in
+            if t == .review { editedABC = backend.transcribeABC }
+        }
+    }
+
+    private func start() { backend.startTranscription(audio: source, task: task) }
+
+    private var needsInstall: Bool {
+        if sheetsage.state != .ready { return true }
+        if case .failed(_, let code) = backend.transcribe, code == "no_env" { return true }
+        return false
+    }
+
+    @ViewBuilder private var content: some View {
+        if needsInstall {
+            installPhase
+        } else {
+            switch backend.transcribe {
+            case .idle, .transcribing: progressPhase
+            case .review: reviewPhase
+            case .failed(let message, let code): failedPhase(message, code)
+            }
+        }
+    }
+
+    @ViewBuilder private var installPhase: some View {
+        if !Paths.packaged {
+            Text("SheetSage2 is not set up. In development mode, create its environment by hand:").font(.callout)
+            Text("""
+                 python3.11 -m venv .venv-sheetsage2
+                 .venv-sheetsage2/bin/pip install torch==2.8.0 torchaudio==2.8.0
+                 .venv-sheetsage2/bin/pip install -r <SheetSage2 snapshot>/requirements.txt soundfile
+                 """).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            Text("See docs/covers.md for details, then reopen this sheet.").font(.caption).foregroundStyle(.secondary)
+        } else if sheetsage.state == .running {
+            ForEach(sheetsage.steps) { s in
+                HStack {
+                    Image(systemName: s.done ? "checkmark.circle.fill" : (s.id == sheetsage.current ? "arrow.triangle.2.circlepath" : "circle"))
+                        .foregroundStyle(s.done ? .green : .secondary)
+                    Text(s.title)
+                }.font(.callout)
+            }
+            ProgressView(value: sheetsage.progress)
+            Text(sheetsage.detail).font(.caption).foregroundStyle(.secondary)
+            if let last = sheetsage.log.last { Text("\(last.time)  \(last.message)").font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle) }
+        } else {
+            Text("Transcription uses SheetSage2, installed on first use: a small model (about 2 GB with its audio encoder) and its own Python environment.").font(.callout)
+            Text("SheetSage2 weights are CC BY-NC 4.0 (non-commercial).").font(.caption).foregroundStyle(.secondary)
+            if case .failed(let message) = sheetsage.state {
+                Text(message).foregroundStyle(.red).font(.caption)
+            }
+            Button("Install transcription support") { sheetsage.install() }.buttonStyle(.borderedProminent)
+        }
+    }
+
+    @ViewBuilder private var progressPhase: some View {
+        Picker("Melody", selection: $task) { Text("Full melody").tag("melody-full"); Text("Vocal only").tag("melody-vocal") }
+            .pickerStyle(.segmented).disabled(backend.transcribe == .transcribing)
+        if backend.transcribe == .transcribing {
+            if let f = backend.transcribeFraction { ProgressView(value: f) } else { ProgressView() }
+            Text(backend.transcribeDetail).font(.caption).foregroundStyle(.secondary)
+            if backend.busy { Text("Songs are generating — transcription shares the machine and both will be slower.").font(.caption).foregroundStyle(.orange) }
+        } else if !backend.connected {
+            Text("Worker not connected").foregroundStyle(.red).font(.caption)
+        } else {
+            Button("Transcribe") { start() }.buttonStyle(.borderedProminent)
+        }
+    }
+
+    @ViewBuilder private var reviewPhase: some View {
+        Text("Review the melody — edit any wrong notes before using it.").font(.caption).foregroundStyle(.secondary)
+        TextEditor(text: $editedABC).font(.system(.caption, design: .monospaced)).frame(maxHeight: .infinity)
+        if !backend.transcribeWarnings.isEmpty {
+            Text(backend.transcribeWarnings.joined(separator: " · ")).font(.caption).foregroundStyle(.orange).lineLimit(2)
+        }
+    }
+
+    @ViewBuilder private func failedPhase(_ message: String, _ code: String) -> some View {
+        Text(message).foregroundStyle(.red).font(.callout)
+        if code == "afconvert" {
+            Text("The file could not be decoded (protected or unsupported) — export it as WAV or M4A first.").font(.caption).foregroundStyle(.secondary)
+        }
+        Button("Retry") { start() }.disabled(!backend.connected)
+    }
+
+    private var bottomBar: some View {
+        HStack {
+            if backend.transcribe == .review {
+                Button("Reveal artifacts") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: backend.transcribeOutput)]) }
+            }
+            Spacer()
+            Button(backend.transcribe == .review ? "Discard" : "Cancel") {
+                if backend.transcribe == .transcribing { backend.cancelTranscription() }
+                backend.transcribe = .idle
+                dismiss()
+            }.keyboardShortcut(.cancelAction)
+            if backend.transcribe == .review {
+                Button("Use melody") {
+                    abc = editedABC
+                    cot = "melody"                 // external ABC requires melody/full planning
+                    backend.transcribe = .idle
+                    dismiss()
+                }.buttonStyle(.borderedProminent).disabled(editedABC.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
         }
     }
 }

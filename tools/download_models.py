@@ -10,7 +10,7 @@ from huggingface_hub import HfApi, snapshot_download
 import importlib
 hf_tqdm = importlib.import_module("huggingface_hub.utils.tqdm")   # the package attribute shadows the module
 
-REPOS = ["m-a-p/YuE2-3B", "m-a-p/YuE2-Vae"]
+REPOS = sys.argv[1:] or ["m-a-p/YuE2-3B", "m-a-p/YuE2-Vae"]   # args override, e.g. SheetSage2 + its MERT base
 api = HfApi()
 total = sum((f.size or 0) for r in REPOS for f in api.model_info(r, files_metadata=True).siblings)
 state = {"bars": {}, "last": 0.0, "samples": []}
