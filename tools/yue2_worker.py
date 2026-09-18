@@ -15,7 +15,8 @@ the whole policy; in short:
   Rendering       always admitted: its tiles interleave with token steps.
 
 Requests: {"cmd": "generate", "style", "lyrics", "cot": "full|melody|off", "seed", "random_seed", "batch",
-           "max_tokens", "abc": str|null, "quality": "draft|full", "engines": "gpu|gpu+ane", "draft_steps",
+           "max_tokens", "abc": str|null, "abc_open": bool (the abc is a hummed opening the planner continues),
+           "quality": "draft|full", "engines": "gpu|gpu+ane", "draft_steps",
            "instrumental": bool, "title": str}     (engines: whether the Neural Engine may synthesize; "gpu" keeps
                                                      its 2.8 GB unmapped. title: names the run folder and is stored with each song)
           {"cmd": "render", "path": song directory or its audio.flac, "quality": "full|draft", "engines": "gpu|gpu+ane"}
@@ -283,7 +284,7 @@ class Song:
         self.quality, self.steps, self.limit, self.instrumental = quality, steps, limit, instrumental
         self.allow_ane = allow_ane                # the user's engine choice: the Neural Engine may take this song
         self.mode = request.cot
-        self.needs_plan = request.cot != "off" and request.abc is None
+        self.needs_plan = request.cot != "off" and (request.abc is None or request.abc_open)
         self.cancel = threading.Event()
         self.state = QUEUED
         self.plan = None; self.codec = None; self.timing = {}; self.truncated = False
@@ -555,13 +556,15 @@ def run_batch(batch):
             rows, timing = generate_tokens(model, prefixes, pipe.generation_config.abc, [s.seed for s in songs], "abc",
                                                    cancelled=cancelled, on_token=reporter("abc", 900, max(len(p) for p in prefixes)),
                                                    lock=TORCH_LOCK)
+            from yue2.pipeline import complete_score_ids
+            rows = [(complete_score_ids(r, tokenizer, ids), t, trunc) for r, (ids, t, trunc) in zip(requests, rows)]
             plans = [SymbolicPlan(r, tokenizer.decode(ids), ids, token_prefixes(r, tokenizer, ids), t, trunc)
                      for r, (ids, t, trunc) in zip(requests, rows)]
             log(f"Scores planned: {[len(p.abc_ids) for p in plans]} tokens in {timing['seconds']:.0f} s")
             if any(s.instrumental for s in songs):
                 # Re-plan from each score with its vocal voice silenced: the tokens then carry no sung melody.
                 from yue2.instrumental import silence_vocals
-                plans = [pipe.plan(request=dataclasses.replace(p.request, abc=silence_vocals(p.abc))) if (s.instrumental and p.abc) else p
+                plans = [pipe.plan(request=dataclasses.replace(p.request, abc=silence_vocals(p.abc), abc_open=False)) if (s.instrumental and p.abc) else p
                          for s, p in zip(songs, plans)]
                 log("Instrumental: vocal voice silenced in the planned score(s)")
         else:
@@ -938,6 +941,10 @@ def submit_generate(req):
     base = int(time.time()) % 10_000_000 if req.get("random_seed") else int(req.get("seed", 831001))
     seeds = [base + i for i in range(n)]
     abc = (req.get("abc") or "").strip() or None
+    abc_open = bool(req.get("abc_open")) and abc is not None
+    if abc_open:
+        from yue2.hum import hum_opening
+        abc = hum_opening(abc)                       # the hummed line as the Vocal voice, ending on its last note
     title = " ".join(str(req.get("title", "")).split())[:120]
     with STAMPS_LOCK:                                    # two jobs submitted in the same second must not share a folder
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + (f"-{slug(title)}" if slug(title) else "")
@@ -951,7 +958,7 @@ def submit_generate(req):
     limit = max(1, min(int(req.get("max_tokens", 9000)), 9000))
     songs = []
     for i, seed in enumerate(seeds):
-        request = SongRequest(style=style, lyrics=lyrics, cot=mode, seed=seed, abc=abc,
+        request = SongRequest(style=style, lyrics=lyrics, cot=mode, seed=seed, abc=abc, abc_open=abc_open,
                               id=f"song{i + 1}", **({"cfg_scale": 1.0} if mode == "off" else {}))
         songs.append(Song(stamp, i + 1, seed, request, out_root / f"song{i + 1}", quality, steps, limit, instrumental, allow_ane, title))
     emit(event="started", job=stamp, output=str(out_root), title=title,

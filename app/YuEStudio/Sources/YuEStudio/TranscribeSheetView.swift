@@ -1,23 +1,27 @@
 import SwiftUI
 import AppKit
 
-struct PickedAudio: Identifiable { let id = UUID(); let url: URL }
+struct PickedAudio: Identifiable { let id = UUID(); let url: URL; var hum = false }
 
 /// Pick a recording → (install SheetSage2 on first use) → transcribe → review the melody ABC.
 /// "Use melody" fills the form's ABC field and forces Planning to "melody" for a cover.
 struct TranscribeSheetView: View {
     let source: URL
+    var hum = false                     // a hummed melody: vocal task, and the score may be left open
     @Binding var abc: String
+    @Binding var abcOpen: Bool
     @Binding var cot: String
     @ObservedObject var sheetsage: SheetSageInstaller
     @EnvironmentObject var backend: Backend
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("transcribeTask") private var task = "melody-full"
+    @AppStorage("transcribeTask") private var storedTask = "melody-full"
+    @State private var openScore = true
     @State private var editedABC = ""
+    private var task: String { hum ? "melody-vocal" : storedTask }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Transcribe \"\(source.lastPathComponent)\"").font(.headline)
+            Text(hum ? "Your hum as a melody score" : "Transcribe \"\(source.lastPathComponent)\"").font(.headline)
             content.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             bottomBar
         }
@@ -85,7 +89,7 @@ struct TranscribeSheetView: View {
     }
 
     @ViewBuilder private var progressPhase: some View {
-        Picker("Melody", selection: $task) { Text("Full melody").tag("melody-full"); Text("Vocal only").tag("melody-vocal") }
+        Picker("Melody", selection: $storedTask) { Text("Full melody").tag("melody-full"); Text("Vocal only").tag("melody-vocal") }
             .pickerStyle(.segmented).disabled(backend.transcribe == .transcribing)
         if backend.transcribe == .transcribing {
             if let f = backend.transcribeFraction { ProgressView(value: f) } else { ProgressView() }
@@ -119,6 +123,12 @@ struct TranscribeSheetView: View {
             if backend.transcribe == .review {
                 Button("Reveal artifacts") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: backend.transcribeOutput)]) }
             }
+            if hum && backend.transcribe == .review {
+                Picker("", selection: $openScore) {
+                    Text("Continue from my hum").tag(true)
+                    Text("Song is exactly my hum").tag(false)
+                }.pickerStyle(.segmented).frame(width: 340).labelsHidden()
+            }
             Spacer()
             Button(backend.transcribe == .review ? "Discard" : "Cancel") {
                 if backend.transcribe == .transcribing { backend.cancelTranscription() }
@@ -128,6 +138,7 @@ struct TranscribeSheetView: View {
             if backend.transcribe == .review {
                 Button("Use melody") {
                     abc = editedABC
+                    abcOpen = hum && openScore
                     cot = "melody"                 // external ABC requires melody/full planning
                     backend.transcribe = .idle
                     dismiss()

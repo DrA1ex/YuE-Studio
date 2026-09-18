@@ -62,6 +62,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <true/>
   <key>NSBonjourServices</key><array>
   <string>_yuestudio._tcp</string></array>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>YuE Studio records a hummed melody to turn it into a song.</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>YuE Studio looks for an iPhone running YuE Remote to use its Neural Engine for synthesis.</string>
   <key>NSHumanReadableCopyright</key>
@@ -100,7 +102,7 @@ else
   for bin in "$APP/Contents/Resources/payload/uv" "$APP/Contents/Resources/payload/yue2-src/src/yue2/ane/libyue2ane.dylib"; do
     codesign --force --options runtime --timestamp --sign "$SIGN" "$bin"
   done
-  codesign --force --options runtime --timestamp --sign "$SIGN" "$APP"
+  codesign --force --options runtime --timestamp --entitlements "$APPDIR/YuEStudio.entitlements" --sign "$SIGN" "$APP"
   codesign --verify --deep --strict "$APP" && echo "signature verified"
 fi
 

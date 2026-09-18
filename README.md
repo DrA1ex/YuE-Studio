@@ -269,6 +269,31 @@ To reproduce the reported benchmark scores, follow the instructions on [🤗 Wil
 
 [Demo and results](https://map-yue2.github.io/#sheetsage2) · [🤗 Model and inference](https://huggingface.co/m-a-p/SheetSage2)
 
+## Hum a melody
+
+In YuE Studio, open "ABC score" in the form and press **Hum a melody…**: record 10 to 30 seconds
+of tune into the mic (on its own, no backing), and SheetSage2 transcribes it into a melody
+score. You then choose whether the song is **exactly your hum** or **continues from it**: in the
+second case the score is left open after your last note and the planner writes the rest of the
+song around your opening, with your lyrics and style. The same choice is available for any
+score pasted into the form ("the score is an opening the planner continues").
+
+From Python, pass the opening with `abc=` and `abc_open=True`:
+
+```python
+from yue2.hum import hum_opening
+opening = hum_opening(Path("hum-score/score.abc").read_text())     # hummed line as the Vocal voice, ending on its last note
+song = pipe(style="indie folk, warm", lyrics=lyrics, cot="melody", abc=opening, abc_open=True)
+```
+
+## iPhone as a second Neural Engine
+
+`app/YuERemote` is a companion iOS app: with it running on an iPhone on the same network, YuE
+Studio uses the phone's Neural Engine as a second synthesis engine, so two queued songs
+synthesize at once (one on the Mac, one on the phone). It needs an Apple developer account to
+install (open `app/YuERemote/YuERemote.xcodeproj` in Xcode, set your team, run on the phone).
+The 2.8 GB of synthesis weights are sent to the phone once. See `docs/apple-silicon.md`.
+
 ## Models and resources
 
 | Resource | Purpose |
@@ -320,11 +345,3 @@ The YuE2 technical report is coming soon. For now, please cite **[MERT](https://
 ## Contact
 
 For collaborations, licensing, and data partnerships, please contact [gezhang@umich.edu](mailto:gezhang@umich.edu).
-
-## iPhone as a second Neural Engine
-
-`app/YuERemote` is a companion iOS app: with it running on an iPhone on the same network, YuE
-Studio uses the phone's Neural Engine as a second synthesis engine, so two queued songs
-synthesize at once (one on the Mac, one on the phone). It needs an Apple developer account to
-install (open `app/YuERemote/YuERemote.xcodeproj` in Xcode, set your team, run on the phone).
-The 2.8 GB of synthesis weights are sent to the phone once. See `docs/apple-silicon.md`.

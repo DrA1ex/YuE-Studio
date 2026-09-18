@@ -186,9 +186,9 @@ final class Backend: ObservableObject {
     }
 
     /// Queue a run; the worker announces its songs with a "started" event.
-    func generate(title: String, style: String, lyrics: String, cot: String, seed: Int, randomSeed: Bool, batch: Int, maxTokens: Int, engine: String, abc: String, quality: String, engines: String, instrumental: Bool) {
+    func generate(title: String, style: String, lyrics: String, cot: String, seed: Int, randomSeed: Bool, batch: Int, maxTokens: Int, engine: String, abc: String, abcOpen: Bool, quality: String, engines: String, instrumental: Bool) {
         send(["cmd": "generate", "title": title, "style": style, "lyrics": lyrics, "cot": cot, "seed": seed, "random_seed": randomSeed,
-              "batch": batch, "max_tokens": maxTokens, "engine": engine, "abc": abc, "quality": quality, "engines": engines, "instrumental": instrumental])
+              "batch": batch, "max_tokens": maxTokens, "engine": engine, "abc": abc, "abc_open": abcOpen, "quality": quality, "engines": engines, "instrumental": instrumental])
     }
 
     /// Synthesize a song from its saved tokens: a full-quality render of a draft, or a stalled song.

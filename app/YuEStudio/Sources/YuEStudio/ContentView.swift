@@ -19,6 +19,8 @@ struct ContentView: View {
     private var engines: String { qualityMode.hasSuffix("-ane") ? "gpu+ane" : "gpu" }
     @AppStorage("instrumental") private var instrumental = false
     @AppStorage("abc") private var abc = ""      // a transcribed score survives relaunch
+    @AppStorage("abcOpen") private var abcOpen = false   // the score is an opening (a hum) the planner continues
+    @State private var humming = false
     @State private var showScore: Song?
     @StateObject private var sheetsage = SheetSageInstaller()
     @State private var transcribeSource: PickedAudio?
@@ -55,7 +57,13 @@ struct ContentView: View {
         .onChange(of: backend.connected) { _, up in if up { backend.useRemote(useRemote ? remote.phone : nil) } }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in backend.rescan() }
         .sheet(item: $transcribeSource) { picked in
-            TranscribeSheetView(source: picked.url, abc: $abc, cot: $cot, sheetsage: sheetsage).environmentObject(backend)
+            TranscribeSheetView(source: picked.url, hum: picked.hum, abc: $abc, abcOpen: $abcOpen, cot: $cot, sheetsage: sheetsage).environmentObject(backend)
+        }
+        .sheet(isPresented: $humming) {
+            HumSheetView { url in
+                backend.transcribe = .idle
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { transcribeSource = PickedAudio(url: url, hum: true) }
+            }
         }
     }
 
@@ -137,11 +145,19 @@ struct ContentView: View {
                 }
                 DisclosureGroup("ABC score (optional)") {
                     TextEditor(text: $abc).font(.system(.caption, design: .monospaced)).frame(height: 100)
+                    if !abc.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Picker("The score is", selection: $abcOpen) {
+                            Text("the whole song").tag(false)
+                            Text("an opening the planner continues").tag(true)
+                        }
+                    }
                     HStack {
                         Button("Transcribe recording…") { pickRecording() }
                             .disabled(!backend.connected || backend.transcribe == .transcribing)
-                        Text("SheetSage2 melody transcription for covers · weights CC BY-NC 4.0").font(.caption).foregroundStyle(.secondary)
+                        Button { humming = true } label: { Label("Hum a melody…", systemImage: "mic") }
+                            .disabled(!backend.connected || backend.transcribe == .transcribing)
                     }
+                    Text("SheetSage2 melody transcription for covers and hummed tunes · weights CC BY-NC 4.0").font(.caption).foregroundStyle(.secondary)
                 }
             }
             Section {
@@ -195,7 +211,7 @@ struct ContentView: View {
             title = suggested; titleAuto = suggested
         }
         backend.generate(title: title.trimmingCharacters(in: .whitespaces), style: style, lyrics: lyrics, cot: cot, seed: seed, randomSeed: randomSeed, batch: batch,
-                         maxTokens: Int(maxSeconds * 25), engine: "auto", abc: abc, quality: quality, engines: engines, instrumental: instrumental)
+                         maxTokens: Int(maxSeconds * 25), engine: "auto", abc: abc, abcOpen: abcOpen, quality: quality, engines: engines, instrumental: instrumental)
     }
 
     private var qualityCaption: String {
