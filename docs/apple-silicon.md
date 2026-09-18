@@ -151,7 +151,11 @@ A retained temp directory does not make a later ANE compile faster
 
 A run can be given a **Title**: it names the run folder (`<timestamp>-<title
 slug>`), is stored in each song's `tokens.json` and `result.json`, and heads
-the run's section and rows in the app. The transport bar under the song list
+the run's section and rows in the app. Left empty, it is chosen from the
+lyrics by the on-device language model (Apple's Foundation Models framework,
+macOS 26 with Apple Intelligence; weak-linked, so on macOS 14 and 15 the first
+lyric line is used instead) when Generate is pressed; a title the model chose
+is replaced on the next run unless you edit it. The transport bar under the song list
 plays the loaded song with pause, back to start, 10-second skips and a
 scrubbing slider (space toggles play). The Style editor has a grab bar to make
 it taller; the height persists.

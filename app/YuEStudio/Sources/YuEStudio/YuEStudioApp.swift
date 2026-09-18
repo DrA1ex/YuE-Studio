@@ -1,6 +1,58 @@
 import SwiftUI
 import AVFoundation
 import AppKit
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
+
+// MARK: - Title suggestions
+
+/// Names a run from its lyrics with the on-device language model (macOS 26 and later, Apple
+/// Intelligence enabled); otherwise from the first line of the lyrics.
+enum TitleSuggester {
+    static func suggest(lyrics: String, style: String, instrumental: Bool) async -> String {
+        if let title = await fromModel(lyrics: lyrics, style: style, instrumental: instrumental), !title.isEmpty { return title }
+        return fallback(lyrics: lyrics, style: style, instrumental: instrumental)
+    }
+
+    private static func fromModel(lyrics: String, style: String, instrumental: Bool) async -> String? {
+        #if canImport(FoundationModels)
+        guard #available(macOS 26.0, *) else { return nil }
+        guard case .available = SystemLanguageModel.default.availability else { return nil }
+        let words = lyrics.split(whereSeparator: { $0.isWhitespace }).filter { !$0.hasPrefix("[") }
+        let body = instrumental || words.count < 3
+            ? "An instrumental piece in this style: \(style)"
+            : "Lyrics:\n" + String(lyrics.prefix(3000))
+        let session = LanguageModelSession(instructions:
+            "You name songs. Given lyrics or a style description, reply with one evocative title of two to five words. Title only: no quotes, no punctuation at the end, no explanation.")
+        do {
+            let reply = try await session.respond(to: body).content
+            return clean(reply)
+        } catch {
+            return nil
+        }
+        #else
+        return nil
+        #endif
+    }
+
+    private static func clean(_ text: String) -> String {
+        var t = text.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        t = t.trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”‘’.!,:; "))
+        if t.lowercased().hasPrefix("title:") { t = String(t.dropFirst(6)).trimmingCharacters(in: .whitespaces) }
+        let capped = t.split(separator: " ").prefix(8).joined(separator: " ")
+        return String(capped.prefix(60))
+    }
+
+    /// The first line of lyrics with words in it, up to five words; or the style's first words.
+    static func fallback(lyrics: String, style: String, instrumental: Bool) -> String {
+        let lines = lyrics.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+        if !instrumental, let line = lines.first(where: { !$0.isEmpty && !$0.hasPrefix("[") }) {
+            return clean(line.split(separator: " ").prefix(5).joined(separator: " ").capitalized)
+        }
+        return clean(style.split(separator: " ").prefix(4).joined(separator: " ").capitalized)
+    }
+}
 import UniformTypeIdentifiers
 
 // MARK: - Paths
@@ -738,6 +790,8 @@ struct ContentView: View {
     @AppStorage("logPanelHeight") private var logPanelHeight = 130.0
     @State private var logDragStart: Double? = nil
     @AppStorage("title") private var title = ""
+    @AppStorage("titleAuto") private var titleAuto = ""    // the last title the model chose: replaced on the next Generate unless edited
+    @State private var naming = false
     @AppStorage("styleHeight") private var styleHeight = 72.0
     @State private var styleDragStart: Double? = nil
 
@@ -773,7 +827,7 @@ struct ContentView: View {
     private var form: some View {
         Form {
             Section("Song") {
-                TextField("Title (optional)", text: $title)
+                TextField("Title (chosen from the lyrics if left empty)", text: $title)
                 Text("Style").font(.caption).foregroundStyle(.secondary)
                 TextEditor(text: $style).font(.body).frame(height: max(44, min(styleHeight, 400)))
                 resizeHandle(height: $styleHeight, dragStart: $styleDragStart, range: 44...400)
@@ -810,11 +864,10 @@ struct ContentView: View {
             }
             Section {
                 HStack {
-                    Button(action: {
-                        backend.generate(title: title, style: style, lyrics: lyrics, cot: cot, seed: seed, randomSeed: randomSeed, batch: batch,
-                                         maxTokens: Int(maxSeconds * 25), engine: "auto", abc: abc, quality: quality, engines: engines, instrumental: instrumental)
-                    }) { Label(backend.busy ? "Add to queue" : "Generate", systemImage: backend.busy ? "plus" : "play.fill").frame(maxWidth: .infinity) }
-                        .buttonStyle(.borderedProminent).keyboardShortcut(.return, modifiers: .command).disabled(!backend.connected)
+                    Button(action: { Task { await generateTapped() } }) {
+                        Label(naming ? "Choosing a title…" : backend.busy ? "Add to queue" : "Generate", systemImage: backend.busy ? "plus" : "play.fill").frame(maxWidth: .infinity)
+                    }
+                        .buttonStyle(.borderedProminent).keyboardShortcut(.return, modifiers: .command).disabled(!backend.connected || naming)
                     Button(action: { backend.stop() }) { Label("Stop all", systemImage: "stop.fill") }
                         .disabled(!backend.busy)
                 }
@@ -823,6 +876,19 @@ struct ContentView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    /// An empty Title (or one the model chose last time) is filled from the lyrics before the run is queued.
+    private func generateTapped() async {
+        let typed = title.trimmingCharacters(in: .whitespaces)
+        if typed.isEmpty || typed == titleAuto {
+            naming = true
+            let suggested = await TitleSuggester.suggest(lyrics: lyrics, style: style, instrumental: instrumental)
+            naming = false
+            title = suggested; titleAuto = suggested
+        }
+        backend.generate(title: title.trimmingCharacters(in: .whitespaces), style: style, lyrics: lyrics, cot: cot, seed: seed, randomSeed: randomSeed, batch: batch,
+                         maxTokens: Int(maxSeconds * 25), engine: "auto", abc: abc, quality: quality, engines: engines, instrumental: instrumental)
     }
 
     private var qualityCaption: String {
