@@ -158,7 +158,8 @@ lyric line is used instead) when Generate is pressed; a title the model chose
 is replaced on the next run unless you edit it. Beside the Lyrics label,
 **Write lyrics** (shown only when that model is available) writes lyrics for
 the style and title with guided generation (one described field per section,
-temperature 0.9: free-form prompting made the small model repeat itself). It
+temperature 0.9: free-form prompting made the small model repeat itself) after a
+sheet asks what the song is about; a spinner covers the lyrics box meanwhile. It
 refuses with an alert while songs are queued or generating, since the model
 shares the chip with the engines, and asks before replacing lyrics you typed. The transport bar under the song list
 plays the loaded song with pause, back to start, 10-second skips and a
