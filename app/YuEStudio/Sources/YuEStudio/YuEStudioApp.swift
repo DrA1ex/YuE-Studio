@@ -7,9 +7,60 @@ import FoundationModels
 
 // MARK: - Title suggestions
 
+#if canImport(FoundationModels)
+@available(macOS 26.0, *)
+@Generable(description: "Original song lyrics")
+struct WrittenLyrics {
+    @Guide(description: "Verse 1: four to six lines that set a scene with concrete images; no line repeated", .count(4...6))
+    var verse1: [String]
+    @Guide(description: "Chorus: four lines with the hook, memorable and singable; different from the verses", .count(3...5))
+    var chorus: [String]
+    @Guide(description: "Verse 2: four to six lines that move the story on with new images, not those of verse 1", .count(4...6))
+    var verse2: [String]
+    @Guide(description: "Bridge: three or four lines with a turn or a new perspective", .count(2...4))
+    var bridge: [String]
+    @Guide(description: "Outro: two or three closing lines", .count(2...3))
+    var outro: [String]
+}
+#endif
+
 /// Names a run from its lyrics with the on-device language model (macOS 26 and later, Apple
 /// Intelligence enabled); otherwise from the first line of the lyrics.
 enum TitleSuggester {
+    /// The on-device model can be used right now (macOS 26, Apple Intelligence on, model downloaded).
+    static var modelAvailable: Bool {
+        #if canImport(FoundationModels)
+        guard #available(macOS 26.0, *) else { return false }
+        if case .available = SystemLanguageModel.default.availability { return true }
+        return false
+        #else
+        return false
+        #endif
+    }
+
+    /// Lyrics for a song from its style and title, in the generator's format; nil if the model
+    /// is unavailable. Guided generation (one field per section, each described) keeps the small
+    /// on-device model from repeating itself, which free-form prompting did.
+    static func writeLyrics(style: String, title: String) async -> Result<String, Error>? {
+        #if canImport(FoundationModels)
+        guard #available(macOS 26.0, *), modelAvailable else { return nil }
+        let session = LanguageModelSession(instructions:
+            "You write original, vivid song lyrics with varied imagery and no repeated lines except the chorus. Plain words, one phrase per line, no chord names, no markdown.")
+        let request = "Write lyrics for a song.\nStyle: \(style.isEmpty ? "a popular song" : style)" + (title.isEmpty ? "" : "\nTitle: \(title)")
+        do {
+            let l = try await session.respond(to: request, generating: WrittenLyrics.self, options: GenerationOptions(temperature: 0.9)).content
+            let clean = { (lines: [String]) in lines.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
+            let text = ["[Verse]"] + clean(l.verse1) + ["", "[Chorus]"] + clean(l.chorus) + ["", "[Verse]"] + clean(l.verse2)
+                + ["", "[Chorus]"] + clean(l.chorus) + ["", "[Bridge]"] + clean(l.bridge) + ["", "[Outro]"] + clean(l.outro)
+            return .success(text.joined(separator: "\n"))
+        } catch {
+            return .failure(error)
+        }
+        #else
+        return nil
+        #endif
+    }
+
     static func suggest(lyrics: String, style: String, instrumental: Bool) async -> String {
         if let title = await fromModel(lyrics: lyrics, style: style, instrumental: instrumental), !title.isEmpty { return title }
         return fallback(lyrics: lyrics, style: style, instrumental: instrumental)
@@ -792,6 +843,9 @@ struct ContentView: View {
     @AppStorage("title") private var title = ""
     @AppStorage("titleAuto") private var titleAuto = ""    // the last title the model chose: replaced on the next Generate unless edited
     @State private var naming = false
+    @State private var writingLyrics = false
+    @State private var lyricsAlert: String?                // shown when writing lyrics is refused or fails
+    @State private var confirmOverwrite = false
     @AppStorage("styleHeight") private var styleHeight = 72.0
     @State private var styleDragStart: Double? = nil
 
@@ -831,7 +885,22 @@ struct ContentView: View {
                 Text("Style").font(.caption).foregroundStyle(.secondary)
                 TextEditor(text: $style).font(.body).frame(height: max(44, min(styleHeight, 400)))
                 resizeHandle(height: $styleHeight, dragStart: $styleDragStart, range: 44...400)
-                Text("Lyrics").font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Text("Lyrics").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    if TitleSuggester.modelAvailable {
+                        Button(writingLyrics ? "Writing…" : "Write lyrics") { writeLyricsTapped() }
+                            .font(.caption).disabled(writingLyrics || naming)
+                            .help("Write lyrics for the style and title with the Mac's on-device language model")
+                    }
+                }
+                .alert("Can't write lyrics now", isPresented: Binding(get: { lyricsAlert != nil }, set: { if !$0 { lyricsAlert = nil } })) {
+                    Button("OK", role: .cancel) {}
+                } message: { Text(lyricsAlert ?? "") }
+                .confirmationDialog("Replace the current lyrics?", isPresented: $confirmOverwrite, titleVisibility: .visible) {
+                    Button("Replace", role: .destructive) { Task { await writeLyrics() } }
+                    Button("Cancel", role: .cancel) {}
+                } message: { Text("The lyrics box is not empty. The on-device model will write new lyrics for the style and title.") }
                 TextEditor(text: $lyrics).font(.system(.body, design: .monospaced)).frame(minHeight: 220)
             }
             Section("Run") {
@@ -876,6 +945,25 @@ struct ContentView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    /// Writing lyrics runs the on-device model, which shares the chip with the engines: refused while songs are in flight.
+    private func writeLyricsTapped() {
+        if backend.busy {
+            lyricsAlert = "Songs are generating. The on-device language model would take power from the GPU and Neural Engine, so wait until the queue is empty."
+            return
+        }
+        if lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { Task { await writeLyrics() } } else { confirmOverwrite = true }
+    }
+
+    private func writeLyrics() async {
+        writingLyrics = true
+        defer { writingLyrics = false }
+        switch await TitleSuggester.writeLyrics(style: style, title: title.trimmingCharacters(in: .whitespaces)) {
+        case .success(let text)?: lyrics = text
+        case .failure(let error)?: lyricsAlert = "The on-device model declined: \(error.localizedDescription)"
+        case nil: lyricsAlert = "The on-device language model is not available on this Mac."
+        }
     }
 
     /// An empty Title (or one the model chose last time) is filled from the lyrics before the run is queued.
