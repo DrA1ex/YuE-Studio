@@ -19,8 +19,12 @@ struct WrittenLyrics {
     var verse2: [String]
     @Guide(description: "Bridge: three or four lines with a turn or a new perspective", .count(2...4))
     var bridge: [String]
-    @Guide(description: "Outro: two or three closing lines", .count(2...3))
+    @Guide(description: "Outro: two or three complete closing lines that end the song", .count(2...3))
     var outro: [String]
+    // The small model fumbles the closing of its last field (brackets leak into the text), so the
+    // outro is not last: this throwaway field takes the damage.
+    @Guide(description: "One word for the mood of the song")
+    var mood: String
 }
 #endif
 
@@ -49,8 +53,9 @@ enum TitleSuggester {
         let request = "Write lyrics for a song.\nStyle: \(style.isEmpty ? "a popular song" : style)"
             + (title.isEmpty ? "" : "\nTitle: \(title)") + (about.isEmpty ? "" : "\nThe song is about: \(about)")
         do {
-            let l = try await session.respond(to: request, generating: WrittenLyrics.self, options: GenerationOptions(temperature: 0.9)).content
-            let clean = { (lines: [String]) in lines.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
+            let l = try await session.respond(to: request, generating: WrittenLyrics.self,
+                                              options: GenerationOptions(temperature: 0.9, maximumResponseTokens: 1500)).content
+            let clean = { (lines: [String]) in lines.map(scrubLine).filter { !$0.isEmpty } }
             let text = ["[Verse]"] + clean(l.verse1) + ["", "[Chorus]"] + clean(l.chorus) + ["", "[Verse]"] + clean(l.verse2)
                 + ["", "[Chorus]"] + clean(l.chorus) + ["", "[Bridge]"] + clean(l.bridge) + ["", "[Outro]"] + clean(l.outro)
             return .success(text.joined(separator: "\n"))
@@ -60,6 +65,14 @@ enum TitleSuggester {
         #else
         return nil
         #endif
+    }
+
+    /// Strip structured-output debris (stray brackets, quotes, commas) from the ends of a line.
+    private static func scrubLine(_ line: String) -> String {
+        var t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        while let last = t.last, "]}\",".contains(last) { t.removeLast() }
+        while let first = t.first, "[{\"".contains(first) { t.removeFirst() }
+        return t.trimmingCharacters(in: .whitespaces)
     }
 
     static func suggest(lyrics: String, style: String, instrumental: Bool) async -> String {
