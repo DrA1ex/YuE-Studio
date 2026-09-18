@@ -38,3 +38,6 @@ tools/ane/ane_synth_probe
 requests/
 app/YuERemote/build/
 app/YuERemote/*.xcodeproj/xcuserdata/
+app/YuEStudio/.swiftpm/xcode/package.xcworkspace/xcuserdata
+uv.lock
+app/YuEStudio/.swiftpm/xcode/xcuserdata
