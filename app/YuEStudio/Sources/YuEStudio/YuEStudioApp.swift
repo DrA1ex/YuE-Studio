@@ -847,6 +847,7 @@ struct ContentView: View {
     @State private var writingLyrics = false
     @State private var lyricsAlert: String?                // shown when writing lyrics is refused or fails
     @State private var askAbout = false                    // the "what is the song about?" sheet
+    @State private var lyricsVersion = 0                   // bumped on programmatic replacement so the editor rebuilds
     @AppStorage("lyricsAbout") private var lyricsAbout = ""
     @AppStorage("styleHeight") private var styleHeight = 72.0
     @State private var styleDragStart: Double? = nil
@@ -904,7 +905,7 @@ struct ContentView: View {
                         Text("What should the song be about?").font(.headline)
                         TextEditor(text: $lyricsAbout).font(.body).frame(height: 90)
                             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
-                        Text("A theme, a story, a feeling, a place. The style" + (title.trimmingCharacters(in: .whitespaces).isEmpty ? "" : " and the title") + " are used too."
+                        Text("A theme, a story, a feeling, a place. The style" + ((title.trimmingCharacters(in: .whitespaces).isEmpty || title.trimmingCharacters(in: .whitespaces) == titleAuto) ? " is" : " and the title are") + " used too."
                              + (lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : " The current lyrics will be replaced."))
                             .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         HStack {
@@ -915,6 +916,7 @@ struct ContentView: View {
                     }.padding(20).frame(width: 460)
                 }
                 TextEditor(text: $lyrics).font(.system(.body, design: .monospaced)).frame(minHeight: 220)
+                    .id(lyricsVersion)
                     .disabled(writingLyrics)
                     .overlay {
                         if writingLyrics {
@@ -979,9 +981,14 @@ struct ContentView: View {
     private func writeLyrics() async {
         writingLyrics = true
         defer { writingLyrics = false }
-        switch await TitleSuggester.writeLyrics(style: style, title: title.trimmingCharacters(in: .whitespaces),
+        // A title the model chose from the previous lyrics must not steer the new ones: drop it, and
+        // let the next Generate name the song from what gets written.
+        let typed = title.trimmingCharacters(in: .whitespaces)
+        let userTitle = (typed.isEmpty || typed == titleAuto) ? "" : typed
+        if userTitle.isEmpty { title = ""; titleAuto = "" }
+        switch await TitleSuggester.writeLyrics(style: style, title: userTitle,
                                                 about: lyricsAbout.trimmingCharacters(in: .whitespacesAndNewlines)) {
-        case .success(let text)?: lyrics = text
+        case .success(let text)?: lyrics = text; lyricsVersion += 1
         case .failure(let error)?: lyricsAlert = "The on-device model declined: \(error.localizedDescription)"
         case nil: lyricsAlert = "The on-device language model is not available on this Mac."
         }
