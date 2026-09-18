@@ -147,14 +147,23 @@ Four changes:
 A retained temp directory does not make a later ANE compile faster
 (28.8 s vs 26.8 s for the largest program); the per-process compile remains.
 
-## Draft quality and full renders
+## Titles, playback and the form
+
+A run can be given a **Title**: it names the run folder (`<timestamp>-<title
+slug>`), is stored in each song's `tokens.json` and `result.json`, and heads
+the run's section and rows in the app. The transport bar under the song list
+plays the loaded song with pause, back to start, 10-second skips and a
+scrubbing slider (space toggles play). The Style editor has a grab bar to make
+it taller; the height persists.
+
+## Quality and engines
 
 Synthesis is the expensive stage for long songs, and most of its cost is
-independent of whether the song is any good. The app therefore defaults to
-**Draft** quality: the score and tokens are generated exactly as before (they
-define the song), and synthesis runs 8 midpoint steps on MLX instead of 32. No
-Neural Engine compile is involved. Measured on a 20 s song against the 32-step
-reference (`tools/bench_draft.py`):
+independent of whether the song is any good. The app's Quality menu therefore
+offers four modes: **Draft (GPU)**, **Draft (GPU + Neural Engine)**, **Full
+(GPU)** and **Full (GPU + Neural Engine)**. Draft runs 8 midpoint steps
+instead of 32 with the same score, tokens, seed and noise. Measured on a 20 s
+song against the 32-step reference (`tools/bench_draft.py`):
 
 | steps | time | latent corr | rel. RMS error |
 | --- | --- | --- | --- |
@@ -163,18 +172,20 @@ reference (`tools/bench_draft.py`):
 | 12 | 28 s | 0.9998 | 0.018 |
 | 8 | 18 s | 0.9996 | 0.030 |
 
-Each draft row has **Render full quality**, which re-synthesizes from the saved
-tokens with the same seed and noise at 32 steps (worker command `render`),
-keeps the preview as `draft.flac`, and replaces `audio.flac`. `result.json`
-records `quality`, `ode_steps` and `nar_engine`.
+The engine part (`engines: gpu|gpu+ane` in the worker request) says whether the
+scheduler may give the song to the Neural Engine. With "GPU" only, the Neural
+Engine's 2.8 GB of weight surfaces are never mapped, the lowest-memory setting
+and the right one on 16 GB Macs. Drafts on the Neural Engine were pointless
+while a bucket's compile took minutes; with one shared program per bucket it is
+seconds to a minute, so they are offered. The Neural Engine is used only for
+lengths its compiler accepts (up to 12288 NAR rows with MIL v7); longer songs
+stay on the GPU whatever the mode.
 
-Engine choice per song (`choose_engine` in the worker): drafts use MLX; "auto"
-uses the Neural Engine only when the bucket has at most 8192 NAR rows (about
-5.4 minutes of audio), because its compiler rejects larger programs (seen at
-8704 x 12288 and 9216 x 14336); longer songs use MLX. Compile time grows roughly
-with S x (S + P): under a minute for a 20 s song, 6 minutes for 4 minutes of
-audio, about 30 minutes for 5 minutes, and the ANE solve is only ~1.3x faster
-than MLX at that length, so a single long song is faster on MLX end to end.
+Each draft row has **Render full quality**, which re-synthesizes from the saved
+tokens with the same seed and noise at 32 steps (worker command `render`) with
+the engine choice current in the menu, keeps the preview as `draft.flac`, and
+replaces `audio.flac`. `result.json` records `quality`, `ode_steps` and
+`nar_engine`.
 
 ## One program per bucket (weights as inputs)
 

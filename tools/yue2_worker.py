@@ -15,8 +15,10 @@ the whole policy; in short:
   Rendering       always admitted: its tiles interleave with token steps.
 
 Requests: {"cmd": "generate", "style", "lyrics", "cot": "full|melody|off", "seed", "random_seed", "batch",
-           "max_tokens", "abc": str|null, "quality": "draft|full", "draft_steps", "instrumental": bool}
-          {"cmd": "render", "path": song directory or its audio.flac, "quality": "full|draft"}
+           "max_tokens", "abc": str|null, "quality": "draft|full", "engines": "gpu|gpu+ane", "draft_steps",
+           "instrumental": bool, "title": str}     (engines: whether the Neural Engine may synthesize; "gpu" keeps
+                                                     its 2.8 GB unmapped. title: names the run folder and is stored with each song)
+          {"cmd": "render", "path": song directory or its audio.flac, "quality": "full|draft", "engines": "gpu|gpu+ane"}
           {"cmd": "cancel", "path"}   {"cmd": "stop"}   {"cmd": "ping"}   {"cmd": "quit"}
           {"cmd": "transcribe", "id", "audio", "task": "melody-full|melody-vocal", "offline": bool}
           {"cmd": "transcribe_cancel", "id"}
@@ -220,12 +222,14 @@ class Song:
     """One song on its way through the stages: a process with a priority (its arrival number)."""
     _sequence = itertools.count(1)
 
-    def __init__(self, run, index, seed, request, directory, quality, steps, limit, instrumental=False):
+    def __init__(self, run, index, seed, request, directory, quality, steps, limit, instrumental=False, allow_ane=True, title=""):
         self.priority = next(Song._sequence)
+        self.title = title
         self.run, self.index, self.seed, self.request = run, index, seed, request
         self.directory = Path(directory)
         self.path = str(self.directory / "audio.flac")
         self.quality, self.steps, self.limit, self.instrumental = quality, steps, limit, instrumental
+        self.allow_ane = allow_ane                # the user's engine choice: the Neural Engine may take this song
         self.mode = request.cot
         self.needs_plan = request.cot != "off" and request.abc is None
         self.cancel = threading.Event()
@@ -255,8 +259,8 @@ class Song:
         emit(event="progress", path=self.path, fraction=max(0.0, min(1.0, fraction)), detail=detail, **extra)
 
     def decide_engine(self):
-        """Full-quality songs go to the Neural Engine when its compiler accepts their length."""
-        self.wants_ane = self.quality == "full" and ane_can_take(self.frames)
+        """A song goes to the Neural Engine when the user allowed it and its compiler accepts the length."""
+        self.wants_ane = self.allow_ane and ane_can_take(self.frames)
 
 
 # ── Scheduler ────────────────────────────────────────────────────────────────
@@ -423,7 +427,7 @@ def save_tokens(song):
     write_json(song.directory / "request.json", song.request.to_dict())
     write_json(song.directory / "tokens.json", {"seed": song.seed, "frames": len(song.codec), "quality": song.quality,
                                                "steps": song.steps, "priority": song.priority, "truncated": bool(song.truncated),
-                                               "timing": song.timing})
+                                               "title": song.title, "timing": song.timing})
 
 
 def run_batch(batch):
@@ -754,12 +758,14 @@ def run_render(song):
                 json.loads((directory / "result.json").read_text()).get("quality") == "draft":
             (directory / "audio.flac").replace(directory / "draft.flac")      # keep the preview beside the final render
         result = result_song.save_artifacts(directory)
-        result.update({"quality": song.quality, "ode_steps": song.steps, "nar_engine": song.used_engine, "priority": song.priority})
+        result.update({"quality": song.quality, "ode_steps": song.steps, "nar_engine": song.used_engine, "priority": song.priority,
+                       "title": song.title})
         (directory / "result.json").write_text(json.dumps(result, indent=2))
         length = len(audio) / 48000
         log(f"Saved {directory / 'audio.flac'} ({length:.1f} s, {song.quality})")
         emit(event="song", index=song.index, path=song.path, score=plan.abc or "", seconds=round(length, 1), seed=song.seed,
-             truncated=bool(song.truncated or plan.truncated), quality=song.quality, steps=song.steps, engine=song.used_engine)
+             truncated=bool(song.truncated or plan.truncated), quality=song.quality, steps=song.steps, engine=song.used_engine,
+             title=song.title)
         SCHED.finish(song, DONE)
     except InterruptedError:
         SCHED.finish(song, CANCELLED, "stopped")
@@ -770,6 +776,18 @@ def run_render(song):
 
 
 # ── Requests ─────────────────────────────────────────────────────────────────
+
+STAMPS_LOCK = threading.Lock()
+STAMPS = set()                                            # run folders handed out this session
+
+
+def slug(title, limit=40):
+    """A filename-safe form of a title for the run folder: letters, digits and single dashes."""
+    import re, unicodedata
+    text = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
+    text = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-")
+    return text[:limit].rstrip("-")
+
 
 def steps_for(quality, req):
     if quality == "draft":
@@ -789,26 +807,30 @@ def submit_generate(req):
         if mode == "off":
             mode = "full"                      # the vocal voice can only be silenced in a planned score
     quality = "draft" if req.get("quality", "draft") == "draft" else "full"
+    allow_ane = req.get("engines", "gpu+ane" if quality == "full" else "gpu") != "gpu"
     base = int(time.time()) % 10_000_000 if req.get("random_seed") else int(req.get("seed", 831001))
     seeds = [base + i for i in range(n)]
     abc = (req.get("abc") or "").strip() or None
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_root = OUTPUT_DIR / stamp
-    with SCHED.cv:
-        taken = {s.directory.parent for s in SCHED.songs}
-    while out_root in taken or out_root.exists():                                      # two jobs in one second
-        stamp += "b"; out_root = OUTPUT_DIR / stamp
+    title = " ".join(str(req.get("title", "")).split())[:120]
+    with STAMPS_LOCK:                                    # two jobs submitted in the same second must not share a folder
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + (f"-{slug(title)}" if slug(title) else "")
+        out_root = OUTPUT_DIR / stamp
+        with SCHED.cv:
+            taken = {s.directory.parent for s in SCHED.songs} | STAMPS
+        while out_root in taken or out_root.exists():
+            stamp += "b"; out_root = OUTPUT_DIR / stamp
+        STAMPS.add(out_root)
     steps = steps_for(quality, req)
     limit = max(1, min(int(req.get("max_tokens", 9000)), 9000))
     songs = []
     for i, seed in enumerate(seeds):
         request = SongRequest(style=style, lyrics=lyrics, cot=mode, seed=seed, abc=abc,
                               id=f"song{i + 1}", **({"cfg_scale": 1.0} if mode == "off" else {}))
-        songs.append(Song(stamp, i + 1, seed, request, out_root / f"song{i + 1}", quality, steps, limit, instrumental))
-    emit(event="started", job=stamp, output=str(out_root),
+        songs.append(Song(stamp, i + 1, seed, request, out_root / f"song{i + 1}", quality, steps, limit, instrumental, allow_ane, title))
+    emit(event="started", job=stamp, output=str(out_root), title=title,
          songs=[{"index": s.index, "seed": s.seed, "path": s.path, "priority": s.priority} for s in songs])
-    log(f"Queued {stamp}: {n} song(s), {quality} quality ({steps} steps), seeds {seeds}, priorities {[s.priority for s in songs]}"
-        + (", instrumental" if instrumental else ""))
+    log(f"Queued {stamp}: {n} song(s), {quality} quality ({steps} steps, {'GPU + Neural Engine' if allow_ane else 'GPU only'}), "
+        f"seeds {seeds}, priorities {[s.priority for s in songs]}" + (", instrumental" if instrumental else ""))
     SCHED.submit(songs)
 
 
@@ -825,6 +847,7 @@ def submit_render(req):
     if SCHED.find(str(directory / "audio.flac")) is not None:
         emit(event="error", message=f"{directory.name} is already queued"); return
     quality = "draft" if req.get("quality", "full") == "draft" else "full"
+    allow_ane = req.get("engines", "gpu+ane" if quality == "full" else "gpu") != "gpu"
     plan = SymbolicPlan.load(directory)
     codec = np.load(directory / "semantic.npy", allow_pickle=False).astype(int).tolist()
     previous = {}
@@ -834,14 +857,16 @@ def submit_render(req):
     truncated = previous.get("truncated")
     truncated = bool(truncated.get("semantic", False) if isinstance(truncated, dict) else truncated)
     index = int(directory.name[4:]) if directory.name.startswith("song") and directory.name[4:].isdigit() else 1
-    song = Song(directory.parent.name, index, plan.request.seed, plan.request, directory, quality, steps_for(quality, req), 9000)
+    song = Song(directory.parent.name, index, plan.request.seed, plan.request, directory, quality, steps_for(quality, req), 9000,
+                allow_ane=allow_ane, title=str(previous.get("title", "")))
     song.plan, song.codec, song.truncated = plan, codec, truncated
     song.timing = previous.get("timing", {}) if "frames" in previous else {}
     song.decide_engine()
     song.state = SYNTH_WAIT
-    emit(event="started", job=directory.parent.name, output=str(directory.parent),
+    emit(event="started", job=directory.parent.name, output=str(directory.parent), title=song.title,
          songs=[{"index": index, "seed": song.seed, "path": song.path, "priority": song.priority}])
-    log(f"Queued {song.label} for {quality} synthesis ({song.steps} steps, priority {song.priority}): about {len(codec) / 25:.0f} s of audio")
+    log(f"Queued {song.label} for {quality} synthesis ({song.steps} steps, {'GPU + Neural Engine' if allow_ane else 'GPU only'}, "
+        f"priority {song.priority}): about {len(codec) / 25:.0f} s of audio")
     SCHED.submit([song])
 
 

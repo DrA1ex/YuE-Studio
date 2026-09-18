@@ -315,6 +315,7 @@ struct Song: Identifiable, Equatable {
     var gflops: Double? = nil                    // rough throughput of the current stage, GFLOP/s
     var engine = ""                              // synthesis engine (ane / mlx / torch)
     var priority = 0                             // scheduling order (1 = first added); 0 = unknown
+    var title = ""                               // the run's title, if the user gave one
     var directory: URL { URL(fileURLWithPath: path).deletingLastPathComponent() }
     var inFlight: Bool { [.queued, .planning, .tokens, .synth, .decode].contains(status) }
     var runLabel: String {
@@ -322,6 +323,9 @@ struct Song: Identifiable, Equatable {
         guard let d = f.date(from: String(run.prefix(15))) else { return run }
         return d.formatted(date: .abbreviated, time: .standard)
     }
+    /// Section header: the title when there is one, then the time.
+    var runHeader: String { title.isEmpty ? runLabel : "\(title) · \(runLabel)" }
+    var rowName: String { title.isEmpty ? "Song \(index)" : "\(title) · song \(index)" }
     var engineLabel: String {
         switch engine { case "ane": return "Neural Engine"; case "mlx": return "GPU (MLX)"; case "torch": return "GPU (PyTorch)"; case "mlx+ane": return "GPU, then Neural Engine"; default: return "" }
     }
@@ -377,7 +381,8 @@ struct Song: Identifiable, Equatable {
                                   seconds: result?["audio_seconds"] as? Double ?? ((tokens?["frames"] as? Double ?? 0) / 25),
                                   seed: request?["seed"] as? Int ?? 0, truncated: truncated, status: hasAudio ? .ready : .stalled,
                                   quality: result?["quality"] as? String ?? "full",
-                                  detail: hasAudio ? "" : "tokens saved · not synthesized yet"))
+                                  detail: hasAudio ? "" : "tokens saved · not synthesized yet",
+                                  title: (result?["title"] as? String) ?? (tokens?["title"] as? String) ?? ""))
             }
         }
         return songs
@@ -458,14 +463,16 @@ final class Backend: ObservableObject {
                 // draft, or a stalled song) goes back into the pipeline.
                 songs.removeAll { $0.status == .failed }
                 let run = URL(fileURLWithPath: obj["output"] as? String ?? "").lastPathComponent
+                let title = obj["title"] as? String ?? ""
                 for entry in obj["songs"] as? [[String: Any]] ?? [] {
                     let path = entry["path"] as? String ?? ""
                     let priority = entry["priority"] as? Int ?? 0
                     if let i = songs.firstIndex(where: { $0.path == path }) {
                         songs[i].status = .queued; songs[i].detail = "queued"; songs[i].fraction = nil; songs[i].priority = priority
+                        if !title.isEmpty { songs[i].title = title }
                     } else {
                         songs.append(Song(run: run, index: entry["index"] as? Int ?? 0, path: path, score: "", seconds: 0,
-                                          seed: entry["seed"] as? Int ?? 0, truncated: false, status: .queued, detail: "queued", priority: priority))
+                                          seed: entry["seed"] as? Int ?? 0, truncated: false, status: .queued, detail: "queued", priority: priority, title: title))
                     }
                 }
                 sortSongs(); updateBusy()
@@ -493,7 +500,7 @@ final class Backend: ObservableObject {
                                 index: obj["index"] as? Int ?? 0, path: path, score: obj["score"] as? String ?? "",
                                 seconds: obj["seconds"] as? Double ?? 0, seed: obj["seed"] as? Int ?? 0,
                                 truncated: obj["truncated"] as? Bool ?? false, status: .ready, quality: obj["quality"] as? String ?? "full",
-                                engine: obj["engine"] as? String ?? "")
+                                engine: obj["engine"] as? String ?? "", title: obj["title"] as? String ?? "")
                 if let i = songs.firstIndex(where: { $0.path == path }) { songs[i] = song } else { songs.append(song) }
                 sortSongs(); updateBusy()
             case "failed":
@@ -558,17 +565,17 @@ final class Backend: ObservableObject {
     }
 
     /// Queue a run; the worker announces its songs with a "started" event.
-    func generate(style: String, lyrics: String, cot: String, seed: Int, randomSeed: Bool, batch: Int, maxTokens: Int, engine: String, abc: String, quality: String, instrumental: Bool) {
-        send(["cmd": "generate", "style": style, "lyrics": lyrics, "cot": cot, "seed": seed, "random_seed": randomSeed,
-              "batch": batch, "max_tokens": maxTokens, "engine": engine, "abc": abc, "quality": quality, "instrumental": instrumental])
+    func generate(title: String, style: String, lyrics: String, cot: String, seed: Int, randomSeed: Bool, batch: Int, maxTokens: Int, engine: String, abc: String, quality: String, engines: String, instrumental: Bool) {
+        send(["cmd": "generate", "title": title, "style": style, "lyrics": lyrics, "cot": cot, "seed": seed, "random_seed": randomSeed,
+              "batch": batch, "max_tokens": maxTokens, "engine": engine, "abc": abc, "quality": quality, "engines": engines, "instrumental": instrumental])
     }
 
     /// Synthesize a song from its saved tokens: a full-quality render of a draft, or a stalled song.
-    func render(_ song: Song, engine: String, quality: String) {
+    func render(_ song: Song, engine: String, quality: String, engines: String) {
         guard let i = songs.firstIndex(where: { $0.id == song.id }), !songs[i].inFlight else { return }
         songs[i].status = .queued; songs[i].detail = "queued"; songs[i].fraction = nil
         updateBusy()
-        send(["cmd": "render", "path": song.path, "engine": engine, "quality": quality])
+        send(["cmd": "render", "path": song.path, "engine": engine, "quality": quality, "engines": engines])
     }
 
     func cancel(_ song: Song) { send(["cmd": "cancel", "path": song.path]) }
@@ -588,18 +595,97 @@ final class Backend: ObservableObject {
 
 @MainActor
 final class Players: ObservableObject {
-    private var players: [String: AVPlayer] = [:]
-    @Published var playing: String?
+    /// One player at a time, with transport state for the bar under the song list.
+    private var player: AVPlayer?
+    private var timeObserver: Any?
+    private var endObserver: NSObjectProtocol?
+    @Published var playing: String?              // song id when playing
+    @Published var current: Song?                // the song loaded in the player (playing or paused)
+    @Published var currentTime = 0.0
+    @Published var duration = 0.0
+    @Published var isScrubbing = false
+    var isPaused: Bool { current != nil && playing == nil }
+
     func toggle(_ song: Song) {
         guard song.status == .ready else { return }
-        if playing == song.id { players[song.id]?.pause(); playing = nil; return }
-        if let current = playing { players[current]?.pause() }
-        let player = players[song.id] ?? AVPlayer(url: URL(fileURLWithPath: song.path))
-        players[song.id] = player
-        player.seek(to: .zero); player.play(); playing = song.id
+        if current?.id == song.id {
+            if playing != nil { pause() } else { resume() }
+            return
+        }
+        load(song); resume()
     }
+    func pause() { player?.pause(); playing = nil }
+    func resume() {
+        guard let player, let current else { return }
+        if duration > 0 && currentTime >= duration - 0.05 { player.seek(to: .zero) }
+        player.play(); playing = current.id
+    }
+    func seek(to seconds: Double) {
+        guard let player else { return }
+        currentTime = max(0, min(seconds, duration))
+        player.seek(to: CMTime(seconds: currentTime, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+    func skip(_ delta: Double) { seek(to: currentTime + delta) }
+    func rewind() { seek(to: 0) }
     /// A re-rendered file must not be served from the old player.
-    func forget(_ song: Song) { if playing == song.id { players[song.id]?.pause(); playing = nil }; players[song.id] = nil }
+    func forget(_ song: Song) { if current?.id == song.id { unload() } }
+
+    private func load(_ song: Song) {
+        unload()
+        let item = AVPlayerItem(url: URL(fileURLWithPath: song.path))
+        let p = AVPlayer(playerItem: item)
+        player = p; current = song; currentTime = 0
+        duration = song.seconds
+        timeObserver = p.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] t in
+            guard let self, !self.isScrubbing else { return }
+            self.currentTime = t.seconds
+            let d = item.duration.seconds
+            if d.isFinite && d > 0 { self.duration = d }
+        }
+        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.playing = nil; self?.currentTime = self?.duration ?? 0 }
+        }
+    }
+    private func unload() {
+        if let timeObserver, let player { player.removeTimeObserver(timeObserver) }
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        timeObserver = nil; endObserver = nil
+        player?.pause(); player = nil; current = nil; playing = nil; currentTime = 0; duration = 0
+    }
+}
+
+/// Transport bar for the loaded song: back to start, skip, play/pause, scrub with times.
+struct TransportBar: View {
+    @ObservedObject var players: Players
+    var body: some View {
+        let song = players.current
+        let loaded = song != nil
+            HStack(spacing: 10) {
+                Button(action: { players.rewind() }) { Image(systemName: "backward.end.fill") }.help("Back to start")
+                Button(action: { players.skip(-10) }) { Image(systemName: "gobackward.10") }.help("Back 10 seconds")
+                Button(action: { players.playing != nil ? players.pause() : players.resume() }) {
+                    Image(systemName: players.playing != nil ? "pause.fill" : "play.fill").frame(width: 16)
+                }.keyboardShortcut(.space, modifiers: []).help("Play or pause")
+                Button(action: { players.skip(10) }) { Image(systemName: "goforward.10") }.help("Forward 10 seconds")
+                Text(clock(players.currentTime)).monospacedDigit().font(.caption)
+                Slider(value: Binding(get: { players.currentTime }, set: { players.currentTime = $0 }),
+                       in: 0...max(players.duration, 0.1),
+                       onEditingChanged: { editing in
+                           players.isScrubbing = editing
+                           if !editing { players.seek(to: players.currentTime) }
+                       })
+                Text(clock(players.duration)).monospacedDigit().font(.caption)
+                Text(song.map { $0.rowName + ($0.quality == "draft" ? " · draft" : "") } ?? "Press a song's play button to load it")
+                    .font(.caption).foregroundStyle(loaded ? .primary : .secondary).lineLimit(1).truncationMode(.middle).frame(maxWidth: 260, alignment: .trailing)
+            }
+            .buttonStyle(.borderless)
+            .disabled(!loaded)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(.bar)
+    }
+    private func clock(_ t: Double) -> String {
+        let s = Int(t.rounded(.down)); return String(format: "%d:%02d", s / 60, s % 60)
+    }
 }
 
 // MARK: - Views
@@ -641,7 +727,9 @@ struct ContentView: View {
     @AppStorage("randomSeed") private var randomSeed = false
     @AppStorage("batch") private var batch = 2
     @AppStorage("maxSeconds") private var maxSeconds = 120.0
-    @AppStorage("quality") private var quality = "draft"
+    @AppStorage("qualityMode") private var qualityMode = "draft-gpu"   // draft-gpu | draft-gpu-ane | full-gpu | full-gpu-ane
+    private var quality: String { qualityMode.hasPrefix("draft") ? "draft" : "full" }
+    private var engines: String { qualityMode.hasSuffix("-ane") ? "gpu+ane" : "gpu" }
     @AppStorage("instrumental") private var instrumental = false
     @AppStorage("abc") private var abc = ""      // a transcribed score survives relaunch
     @State private var showScore: Song?
@@ -649,12 +737,16 @@ struct ContentView: View {
     @State private var transcribeSource: PickedAudio?
     @AppStorage("logPanelHeight") private var logPanelHeight = 130.0
     @State private var logDragStart: Double? = nil
+    @AppStorage("title") private var title = ""
+    @AppStorage("styleHeight") private var styleHeight = 72.0
+    @State private var styleDragStart: Double? = nil
 
     var body: some View {
         HSplitView {
             form.frame(minWidth: 380, idealWidth: 440)
             VStack(spacing: 0) {
                 results.frame(minHeight: 160)
+                TransportBar(players: players)
                 logSplitter
                 logView.frame(height: max(64, min(logPanelHeight, 600)))
             }.frame(minWidth: 480)
@@ -681,16 +773,23 @@ struct ContentView: View {
     private var form: some View {
         Form {
             Section("Song") {
-                TextField("Style", text: $style, axis: .vertical).lineLimit(2...4).multilineTextAlignment(.leading)
+                TextField("Title (optional)", text: $title)
+                Text("Style").font(.caption).foregroundStyle(.secondary)
+                TextEditor(text: $style).font(.body).frame(height: max(44, min(styleHeight, 400)))
+                resizeHandle(height: $styleHeight, dragStart: $styleDragStart, range: 44...400)
                 Text("Lyrics").font(.caption).foregroundStyle(.secondary)
                 TextEditor(text: $lyrics).font(.system(.body, design: .monospaced)).frame(minHeight: 220)
             }
             Section("Run") {
                 Stepper("Songs per run: \(batch)", value: $batch, in: 1...8)
                 Picker("Planning", selection: $cot) { Text("full").tag("full"); Text("melody").tag("melody"); Text("off").tag("off") }.pickerStyle(.segmented)
-                Picker("Quality", selection: $quality) { Text("Draft (fast preview)").tag("draft"); Text("Full").tag("full") }.pickerStyle(.segmented)
-                Text(quality == "draft" ? "Drafts synthesize in 8 steps on the GPU: same song, rougher sound, no Neural Engine compile. Render any draft at full quality from its row."
-                                        : "Full quality synthesizes in 32 steps; long songs can take an hour or more.").font(.caption).foregroundStyle(.secondary)
+                Picker("Quality", selection: $qualityMode) {
+                    Text("Draft (GPU)").tag("draft-gpu")
+                    Text("Draft (GPU + Neural Engine)").tag("draft-gpu-ane")
+                    Text("Full (GPU)").tag("full-gpu")
+                    Text("Full (GPU + Neural Engine)").tag("full-gpu-ane")
+                }
+                Text(qualityCaption).font(.caption).foregroundStyle(.secondary)
                 Toggle("Instrumental (no vocals)", isOn: $instrumental)
                 if instrumental {
                     Text("Adds no-vocal tags, keeps only the section markers of the lyrics, and silences the vocal voice in the planned score before the song is tokenized. Planning is used even if set to off.").font(.caption).foregroundStyle(.secondary)
@@ -712,8 +811,8 @@ struct ContentView: View {
             Section {
                 HStack {
                     Button(action: {
-                        backend.generate(style: style, lyrics: lyrics, cot: cot, seed: seed, randomSeed: randomSeed, batch: batch,
-                                         maxTokens: Int(maxSeconds * 25), engine: "auto", abc: abc, quality: quality, instrumental: instrumental)
+                        backend.generate(title: title, style: style, lyrics: lyrics, cot: cot, seed: seed, randomSeed: randomSeed, batch: batch,
+                                         maxTokens: Int(maxSeconds * 25), engine: "auto", abc: abc, quality: quality, engines: engines, instrumental: instrumental)
                     }) { Label(backend.busy ? "Add to queue" : "Generate", systemImage: backend.busy ? "plus" : "play.fill").frame(maxWidth: .infinity) }
                         .buttonStyle(.borderedProminent).keyboardShortcut(.return, modifiers: .command).disabled(!backend.connected)
                     Button(action: { backend.stop() }) { Label("Stop all", systemImage: "stop.fill") }
@@ -724,6 +823,15 @@ struct ContentView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var qualityCaption: String {
+        switch qualityMode {
+        case "draft-gpu": return "8 solver steps on the GPU: a quick preview of the same song. Render any draft at full quality from its row."
+        case "draft-gpu-ane": return "8 solver steps; the Neural Engine takes songs it can compile (a few seconds to minutes per new length), the GPU the rest."
+        case "full-gpu": return "32 solver steps on the GPU only. Lowest memory: the Neural Engine's 2.8 GB of weights are never mapped. Best choice on 16 GB Macs."
+        default: return "32 solver steps; the Neural Engine and the GPU work on queued songs together. Long songs can take an hour or more."
+        }
     }
 
     /// One line per stage: what it is working on right now.
@@ -767,7 +875,7 @@ struct ContentView: View {
                 }
             }
             ForEach(runs, id: \.self) { run in
-                Section(backend.songs.first { $0.run == run }?.runLabel ?? run) {
+                Section(backend.songs.first { $0.run == run }?.runHeader ?? run) {
                     ForEach(backend.songs.filter { $0.run == run && !$0.inFlight }) { song in row(song) }
                 }
             }
@@ -788,6 +896,7 @@ struct ContentView: View {
             Button(action: { players.toggle(song) }) {
                 switch song.status {
                 case .ready: Image(systemName: players.playing == song.id ? "pause.circle.fill" : "play.circle.fill").font(.title)
+                    .foregroundStyle(players.current?.id == song.id ? Color.accentColor : Color.primary)
                 case .stalled: Image(systemName: "doc.text").font(.title).foregroundStyle(.secondary).frame(width: 28)
                 case .failed: Image(systemName: "exclamationmark.triangle.fill").font(.title).foregroundStyle(.red).frame(width: 28)
                 case .queued: Image(systemName: "clock").font(.title).foregroundStyle(.secondary).frame(width: 28)
@@ -797,14 +906,14 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 switch song.status {
                 case .ready:
-                    Text("Song \(song.index) · seed \(song.seed) · \(String(format: "%.1f", song.seconds)) s" + (song.truncated ? " · truncated" : "")
+                    Text("\(song.rowName) · seed \(song.seed) · \(String(format: "%.1f", song.seconds)) s" + (song.truncated ? " · truncated" : "")
                          + (song.quality == "draft" ? " · draft" : "")).bold()
                 case .stalled:
-                    Text("Song \(song.index) · seed \(song.seed) · about \(Int(song.seconds)) s · tokens only").bold().foregroundStyle(.secondary)
+                    Text("\(song.rowName) · seed \(song.seed) · about \(Int(song.seconds)) s · tokens only").bold().foregroundStyle(.secondary)
                 case .failed:
-                    Text("Song \(song.index) · seed \(song.seed) · failed").bold().foregroundStyle(.red)
+                    Text("\(song.rowName) · seed \(song.seed) · failed").bold().foregroundStyle(.red)
                 default:
-                    Text((song.priority > 0 ? "#\(song.priority) · " : "") + "Song \(song.index) · seed \(song.seed) · \(song.runLabel)" + (song.quality == "draft" ? " · draft" : "")).bold().foregroundStyle(.secondary)
+                    Text((song.priority > 0 ? "#\(song.priority) · " : "") + "\(song.rowName) · seed \(song.seed) · \(song.runLabel)" + (song.quality == "draft" ? " · draft" : "")).bold().foregroundStyle(.secondary)
                 }
                 if song.inFlight {
                     StageTrack(progress: song.trackProgress)
@@ -819,13 +928,27 @@ struct ContentView: View {
             if song.inFlight {
                 Button("Cancel") { backend.cancel(song) }.disabled(!backend.connected)
             } else if song.status == .stalled || (song.status == .failed && FileManager.default.fileExists(atPath: song.directory.appendingPathComponent("semantic.npy").path)) {
-                Button(quality == "draft" ? "Synthesize draft" : "Synthesize full") { backend.render(song, engine: "auto", quality: quality) }.disabled(!backend.connected)
+                Button(quality == "draft" ? "Synthesize draft" : "Synthesize full") { backend.render(song, engine: "auto", quality: quality, engines: engines) }.disabled(!backend.connected)
             } else if song.quality == "draft" && song.status == .ready {
-                Button("Render full quality") { players.forget(song); backend.render(song, engine: "auto", quality: "full") }.disabled(!backend.connected)
+                Button("Render full quality") { players.forget(song); backend.render(song, engine: "auto", quality: "full", engines: engines) }.disabled(!backend.connected)
             }
             if !song.score.isEmpty { Button("Score") { showScore = song } }
             Button("Reveal") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: song.path)]) }.disabled(song.status != .ready)
         }.padding(.vertical, 2)
+    }
+
+    /// A grab bar under a text editor: drag down to make it taller; the height persists.
+    private func resizeHandle(height: Binding<Double>, dragStart: Binding<Double?>, range: ClosedRange<Double>) -> some View {
+        HStack { Spacer(); Capsule().fill(Color.secondary.opacity(0.35)).frame(width: 44, height: 4); Spacer() }
+            .frame(height: 10).contentShape(Rectangle())
+            .onHover { inside in if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() } }
+            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                .onChanged { v in
+                    let start = dragStart.wrappedValue ?? height.wrappedValue
+                    dragStart.wrappedValue = start
+                    height.wrappedValue = min(range.upperBound, max(range.lowerBound, start + v.translation.height))
+                }
+                .onEnded { _ in dragStart.wrappedValue = nil })
     }
 
     /// The divider above the log: drag up or down to resize it; the height persists.
