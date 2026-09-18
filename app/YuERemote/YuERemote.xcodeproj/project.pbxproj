@@ -1,0 +1,358 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		11A476EFB61384CBDAD9C3FD /* Engine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C4F2C93088F9C8F39052A73 /* Engine.swift */; };
+		38E858AE23CFF3BF34C818DC /* layers2_512_1024.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = AFB6BA03DDC4AB1D6BBEC036 /* layers2_512_1024.mlpackage */; };
+		492075C9621B35EF7C492C7D /* layers1_6656_4096_spi_q512_k1024.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = A1ADDDE2044DB71C9DF5C00C /* layers1_6656_4096_spi_q512_k1024.mlpackage */; };
+		828279D5D040C57290E7EA9E /* layers2_6656_4096_spi_q512_k1024.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = E246A07E48D1C3E016DE1003 /* layers2_6656_4096_spi_q512_k1024.mlpackage */; };
+		861B6055A5EC7A9D93D70D45 /* Tachometer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D16700F05FBF2B70DDB82451 /* Tachometer.swift */; };
+		937A48DB0999FEB256836659 /* YuERemoteApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02C5F2C3E74DB485964A0DF5 /* YuERemoteApp.swift */; };
+		97B2B1E2D8D2AE7C723EC198 /* Bench.swift in Sources */ = {isa = PBXBuildFile; fileRef = C72EFBDA2DB78B436093C842 /* Bench.swift */; };
+		9E5711505FF5BE5BE839D738 /* Protocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 232CE73718BEC175B93982E9 /* Protocol.swift */; };
+		9E8A306362D07577DF54A242 /* layers2_2048_4096_q1024_k2048.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = 1C8023AEB2D639AF000048C5 /* layers2_2048_4096_q1024_k2048.mlpackage */; };
+		9FC324DD3C3F419D17F1AF1B /* layers2_4096_4096_q512_k1024.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = 8E3450197B2079F9ABF0919F /* layers2_4096_4096_q512_k1024.mlpackage */; };
+		E64D00434EEBB1A15F156D66 /* Server.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5ADBC63B904430DFD369D08 /* Server.swift */; };
+		F62F4395A998DFC06165D3AA /* layers2_2048_2048.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = 35AE91C3043B1949C583169B /* layers2_2048_2048.mlpackage */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		02C5F2C3E74DB485964A0DF5 /* YuERemoteApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YuERemoteApp.swift; sourceTree = "<group>"; };
+		1C8023AEB2D639AF000048C5 /* layers2_2048_4096_q1024_k2048.mlpackage */ = {isa = PBXFileReference; path = layers2_2048_4096_q1024_k2048.mlpackage; sourceTree = "<group>"; };
+		232CE73718BEC175B93982E9 /* Protocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Protocol.swift; sourceTree = "<group>"; };
+		2C4F2C93088F9C8F39052A73 /* Engine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Engine.swift; sourceTree = "<group>"; };
+		35AE91C3043B1949C583169B /* layers2_2048_2048.mlpackage */ = {isa = PBXFileReference; path = layers2_2048_2048.mlpackage; sourceTree = "<group>"; };
+		5593E5A2518A8C89EDCDF352 /* YuERemote.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = YuERemote.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		8E3450197B2079F9ABF0919F /* layers2_4096_4096_q512_k1024.mlpackage */ = {isa = PBXFileReference; path = layers2_4096_4096_q512_k1024.mlpackage; sourceTree = "<group>"; };
+		A1ADDDE2044DB71C9DF5C00C /* layers1_6656_4096_spi_q512_k1024.mlpackage */ = {isa = PBXFileReference; path = layers1_6656_4096_spi_q512_k1024.mlpackage; sourceTree = "<group>"; };
+		AFB6BA03DDC4AB1D6BBEC036 /* layers2_512_1024.mlpackage */ = {isa = PBXFileReference; path = layers2_512_1024.mlpackage; sourceTree = "<group>"; };
+		C72EFBDA2DB78B436093C842 /* Bench.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Bench.swift; sourceTree = "<group>"; };
+		D16700F05FBF2B70DDB82451 /* Tachometer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Tachometer.swift; sourceTree = "<group>"; };
+		E246A07E48D1C3E016DE1003 /* layers2_6656_4096_spi_q512_k1024.mlpackage */ = {isa = PBXFileReference; path = layers2_6656_4096_spi_q512_k1024.mlpackage; sourceTree = "<group>"; };
+		F5ADBC63B904430DFD369D08 /* Server.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Server.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		0C8B3EED5E1BDE421139603D = {
+			isa = PBXGroup;
+			children = (
+				F81EFD658233C79122C1D9D3 /* Models */,
+				E22AE464B12C47F96DA5AD4F /* Sources */,
+				E3D26F8C5E36F97C44EC83A2 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		E22AE464B12C47F96DA5AD4F /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				C72EFBDA2DB78B436093C842 /* Bench.swift */,
+				2C4F2C93088F9C8F39052A73 /* Engine.swift */,
+				232CE73718BEC175B93982E9 /* Protocol.swift */,
+				F5ADBC63B904430DFD369D08 /* Server.swift */,
+				D16700F05FBF2B70DDB82451 /* Tachometer.swift */,
+				02C5F2C3E74DB485964A0DF5 /* YuERemoteApp.swift */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		E3D26F8C5E36F97C44EC83A2 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				5593E5A2518A8C89EDCDF352 /* YuERemote.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		F81EFD658233C79122C1D9D3 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				A1ADDDE2044DB71C9DF5C00C /* layers1_6656_4096_spi_q512_k1024.mlpackage */,
+				AFB6BA03DDC4AB1D6BBEC036 /* layers2_512_1024.mlpackage */,
+				35AE91C3043B1949C583169B /* layers2_2048_2048.mlpackage */,
+				1C8023AEB2D639AF000048C5 /* layers2_2048_4096_q1024_k2048.mlpackage */,
+				8E3450197B2079F9ABF0919F /* layers2_4096_4096_q512_k1024.mlpackage */,
+				E246A07E48D1C3E016DE1003 /* layers2_6656_4096_spi_q512_k1024.mlpackage */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		43F80E09C4E8D45F79CD4508 /* YuERemote */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7076863413F326D9A0A63E6D /* Build configuration list for PBXNativeTarget "YuERemote" */;
+			buildPhases = (
+				99FED04022710D9B66448D8D /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = YuERemote;
+			packageProductDependencies = (
+			);
+			productName = YuERemote;
+			productReference = 5593E5A2518A8C89EDCDF352 /* YuERemote.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		80941A36B0B6676CDA211025 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					43F80E09C4E8D45F79CD4508 = {
+						DevelopmentTeam = XET8JG3U5U;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = AACFBA33B7652FE1EF36129E /* Build configuration list for PBXProject "YuERemote" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 0C8B3EED5E1BDE421139603D;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = E3D26F8C5E36F97C44EC83A2 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				43F80E09C4E8D45F79CD4508 /* YuERemote */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		99FED04022710D9B66448D8D /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				97B2B1E2D8D2AE7C723EC198 /* Bench.swift in Sources */,
+				11A476EFB61384CBDAD9C3FD /* Engine.swift in Sources */,
+				9E5711505FF5BE5BE839D738 /* Protocol.swift in Sources */,
+				E64D00434EEBB1A15F156D66 /* Server.swift in Sources */,
+				861B6055A5EC7A9D93D70D45 /* Tachometer.swift in Sources */,
+				937A48DB0999FEB256836659 /* YuERemoteApp.swift in Sources */,
+				492075C9621B35EF7C492C7D /* layers1_6656_4096_spi_q512_k1024.mlpackage in Sources */,
+				F62F4395A998DFC06165D3AA /* layers2_2048_2048.mlpackage in Sources */,
+				9E8A306362D07577DF54A242 /* layers2_2048_4096_q1024_k2048.mlpackage in Sources */,
+				9FC324DD3C3F419D17F1AF1B /* layers2_4096_4096_q512_k1024.mlpackage in Sources */,
+				38E858AE23CFF3BF34C818DC /* layers2_512_1024.mlpackage in Sources */,
+				828279D5D040C57290E7EA9E /* layers2_6656_4096_spi_q512_k1024.mlpackage in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		63C312B0EB5BDE9D6A0B1EA8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		CD39ACED5F08A21720794752 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = YuERemote.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				COREML_CODEGEN_LANGUAGE = None;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = XET8JG3U5U;
+				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "YuE Remote";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "YuE Studio on your Mac connects to this phone to use its Neural Engine.";
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.halftone.YuERemote;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		E96C6807E83AC561AE1DDF27 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = YuERemote.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				COREML_CODEGEN_LANGUAGE = None;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = XET8JG3U5U;
+				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "YuE Remote";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "YuE Studio on your Mac connects to this phone to use its Neural Engine.";
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.halftone.YuERemote;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		F85766ECC924A46C3B2B6037 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		7076863413F326D9A0A63E6D /* Build configuration list for PBXNativeTarget "YuERemote" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E96C6807E83AC561AE1DDF27 /* Debug */,
+				CD39ACED5F08A21720794752 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		AACFBA33B7652FE1EF36129E /* Build configuration list for PBXProject "YuERemote" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				63C312B0EB5BDE9D6A0B1EA8 /* Debug */,
+				F85766ECC924A46C3B2B6037 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 80941A36B0B6676CDA211025 /* Project object */;
+}

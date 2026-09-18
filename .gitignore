@@ -36,3 +36,5 @@ tools/ane/*.data
 tools/ane/introspect
 tools/ane/ane_synth_probe
 requests/
+app/YuERemote/build/
+app/YuERemote/*.xcodeproj/xcuserdata/

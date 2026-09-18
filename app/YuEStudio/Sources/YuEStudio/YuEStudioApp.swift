@@ -444,7 +444,11 @@ struct Song: Identifiable, Equatable {
     var runHeader: String { title.isEmpty ? runLabel : "\(title) · \(runLabel)" }
     var rowName: String { title.isEmpty ? "Song \(index)" : "\(title) · song \(index)" }
     var engineLabel: String {
-        switch engine { case "ane": return "Neural Engine"; case "mlx": return "GPU (MLX)"; case "torch": return "GPU (PyTorch)"; case "mlx+ane": return "GPU, then Neural Engine"; default: return "" }
+        switch engine {
+        case "ane": return "Neural Engine"; case "mlx": return "GPU (MLX)"; case "torch": return "GPU (PyTorch)"
+        case "mlx+ane": return "GPU, then Neural Engine"; case "remote": return "iPhone"; case "mlx+remote": return "GPU, then iPhone"
+        default: return ""
+        }
     }
     /// Position on the stage track: completed stages plus progress within the current one (0 queued ... 4 done).
     var trackProgress: Double {
@@ -512,6 +516,8 @@ final class Backend: ObservableObject {
     @Published var songs: [Song] = []
     @Published var busy = false                  // anything queued or in a stage
     @Published var connected = false
+    @Published var remoteStatus = ""             // what the worker says about the iPhone
+    private var remoteSent: (String, Int)?       // host/port last handed to the worker
 
     enum TranscribeState: Equatable { case idle, transcribing, review, failed(String, code: String) }
     @Published var transcribe: TranscribeState = .idle
@@ -624,6 +630,13 @@ final class Backend: ObservableObject {
                 if let i = songs.firstIndex(where: { $0.path == path }) { songs[i].status = .failed; songs[i].detail = obj["message"] as? String ?? "failed" }
                 updateBusy()
             case "idle": updateBusy(); rescan()
+            case "remote":
+                let name = obj["name"] as? String ?? "iPhone", detail = obj["detail"] as? String ?? ""
+                switch obj["state"] as? String ?? "" {
+                case "connected": remoteStatus = "\(name) ready" + (detail.isEmpty ? "" : " · \(detail)")
+                case "gone": remoteStatus = "\(name) disconnected"; remoteSent = nil; scheduleRemoteRetry()
+                default: remoteStatus = "\(name): \(detail)"; remoteSent = nil; scheduleRemoteRetry()
+                }
             case "error": append("Worker: \(obj["message"] as? String ?? "error")")
             case "transcribe":
                 guard obj["id"] as? String == transcribeID else { break }   // stale run
@@ -696,6 +709,22 @@ final class Backend: ObservableObject {
     }
 
     func cancel(_ song: Song) { send(["cmd": "cancel", "path": song.path]) }
+    var remoteRetry: (() -> Void)?             // set by the view: re-offers the phone after a refusal
+    private func scheduleRemoteRetry() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.remoteRetry?() }
+    }
+
+    /// Hand the worker the phone to use (or nil to stop using one).
+    func useRemote(_ phone: RemoteBrowser.Phone?) {
+        if let phone {
+            guard remoteSent?.0 != phone.host || remoteSent?.1 != phone.port else { return }
+            remoteSent = (phone.host, phone.port)
+            send(["cmd": "remote", "host": phone.host, "port": phone.port, "name": phone.name])
+        } else if remoteSent != nil {
+            remoteSent = nil
+            send(["cmd": "remote", "host": NSNull()])
+        }
+    }
 
     func startTranscription(audio: URL, task: String) {
         transcribeID = UUID().uuidString
@@ -845,6 +874,8 @@ struct ContentView: View {
     @AppStorage("batch") private var batch = 2
     @AppStorage("maxSeconds") private var maxSeconds = 120.0
     @AppStorage("qualityMode") private var qualityMode = "draft-gpu"   // draft-gpu | draft-gpu-ane | full-gpu | full-gpu-ane
+    @AppStorage("useRemote") private var useRemote = true
+    @StateObject private var remote = RemoteBrowser()
     private var quality: String { qualityMode.hasPrefix("draft") ? "draft" : "full" }
     private var engines: String { qualityMode.hasSuffix("-ane") ? "gpu+ane" : "gpu" }
     @AppStorage("instrumental") private var instrumental = false
@@ -876,7 +907,13 @@ struct ContentView: View {
             }.frame(minWidth: 480)
         }
         .frame(minWidth: 960, minHeight: 640)
-        .onAppear { backend.rescan(); if backend.process == nil { backend.start() } }
+        .onAppear {
+            backend.rescan(); if backend.process == nil { backend.start() }; remote.start()
+            backend.remoteRetry = { if useRemote, let phone = remote.phone { backend.useRemote(phone) } }
+        }
+        .onChange(of: remote.phone) { _, phone in backend.useRemote(useRemote ? phone : nil) }
+        .onChange(of: useRemote) { _, on in backend.useRemote(on ? remote.phone : nil) }
+        .onChange(of: backend.connected) { _, up in if up { backend.useRemote(useRemote ? remote.phone : nil) } }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in backend.rescan() }
         .sheet(item: $transcribeSource) { picked in
             TranscribeSheetView(source: picked.url, abc: $abc, cot: $cot, sheetsage: sheetsage).environmentObject(backend)
@@ -948,6 +985,8 @@ struct ContentView: View {
                     Text("Full (GPU + Neural Engine)").tag("full-gpu-ane")
                 }
                 Text(qualityCaption).font(.caption).foregroundStyle(.secondary)
+                Toggle("Use an iPhone's Neural Engine (YuE Remote app)", isOn: $useRemote)
+                Text(useRemote ? (backend.remoteStatus.isEmpty ? remote.detail : backend.remoteStatus) : "off").font(.caption).foregroundStyle(.secondary)
                 Toggle("Instrumental (no vocals)", isOn: $instrumental)
                 if instrumental {
                     Text("Adds no-vocal tags, keeps only the section markers of the lyrics, and silences the vocal voice in the planned score before the song is tokenized. Planning is used even if set to off.").font(.caption).foregroundStyle(.secondary)

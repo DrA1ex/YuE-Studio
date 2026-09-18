@@ -31,6 +31,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSArchitecturePriority</key><array><string>arm64</string></array>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSBonjourServices</key><array><string>_yuestudio._tcp</string></array>
+  <key>NSLocalNetworkUsageDescription</key><string>YuE Studio looks for an iPhone running YuE Remote to use its Neural Engine for synthesis.</string>
   <key>NSHumanReadableCopyright</key><string>YuE2 model: m-a-p (Apache-2.0 code, model licence applies). SheetSage2 weights: CC BY-NC 4.0.</string>
 </dict></plist>
 PLIST

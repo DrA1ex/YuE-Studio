@@ -320,3 +320,11 @@ The YuE2 technical report is coming soon. For now, please cite **[MERT](https://
 ## Contact
 
 For collaborations, licensing, and data partnerships, please contact [gezhang@umich.edu](mailto:gezhang@umich.edu).
+
+## iPhone as a second Neural Engine
+
+`app/YuERemote` is a companion iOS app: with it running on an iPhone on the same network, YuE
+Studio uses the phone's Neural Engine as a second synthesis engine, so two queued songs
+synthesize at once (one on the Mac, one on the phone). It needs an Apple developer account to
+install (open `app/YuERemote/YuERemote.xcodeproj` in Xcode, set your team, run on the phone).
+The 2.8 GB of synthesis weights are sent to the phone once. See `docs/apple-silicon.md`.

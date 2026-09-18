@@ -169,6 +169,58 @@ def ane_can_take(n_frames):
     return ane_available() and ane_runtime.bucket(n_frames + 2, ane_runtime.S_STEP) <= ANE_MAX_FRAMES
 
 
+# ── The iPhone companion (app/YuERemote): a second Neural Engine on the local network ─────────
+REMOTE = None                                     # yue2.remote.client.RemoteClient while a phone is connected
+REMOTE_LOCK = threading.Lock()
+REMOTE_MAX_ROWS = int(os.environ.get("YUE2_REMOTE_MAX_ROWS", 4096))   # largest bucket its compiler has accepted
+
+
+def remote_can_take(song):
+    from yue2.remote.client import S_STEP, bucket
+    return REMOTE is not None and song.allow_ane and not song.remote_failed and bucket(song.frames + 2, S_STEP) <= REMOTE_MAX_ROWS
+
+
+def set_remote(req):
+    """The app found (or lost) the phone: {"cmd": "remote", "host", "port", "name"} / host null."""
+    global REMOTE
+    from yue2.remote.client import RemoteClient
+    host, port, name = req.get("host"), req.get("port"), req.get("name", "")
+    with REMOTE_LOCK:
+        old = REMOTE
+        if not host:
+            if old is not None:
+                REMOTE = None; old.close()
+                log(f"{old.label()} disconnected")
+                emit(event="remote", state="gone", name=old.label())
+            SCHED.tick(); return
+        if old is not None and (old.host, old.port) == (host, int(port)):
+            return
+        try:
+            client = RemoteClient(host, port, name)
+        except Exception as exc:
+            log(f"Cannot use the iPhone at {host}:{port} ({str(exc)[:120]})")
+            emit(event="remote", state="error", name=name, detail=str(exc)[:200]); return
+        if old is not None:
+            old.close()
+        REMOTE = client
+        weights = "weights cached" if client.info.get("weights") else "weights are sent on first use (2.8 GB)"
+        log(f"{client.label()} ready as a synthesis engine ({client.info.get('model', '')}, "
+            f"{client.info.get('memory_available_mb', 0)} MB free, {weights})")
+        emit(event="remote", state="connected", name=client.label(), detail=weights)
+    SCHED.tick()
+
+
+def clear_remote(reason):
+    global REMOTE
+    with REMOTE_LOCK:
+        old, REMOTE = REMOTE, None
+    if old is not None:
+        old.close()
+        log(f"{old.label()} dropped: {reason}")
+        emit(event="remote", state="gone", name=old.label(), detail=reason)
+    SCHED.tick()
+
+
 # ── Throughput estimates (rough, for the status line) ────────────────────────
 # Matmul work only, 2 FLOP per multiply-add, derived from the model shapes; attention counted as
 # QK^T and PV over the attended length. The VAE figure was measured with torch's FLOP counter.
@@ -239,8 +291,9 @@ class Song:
         self.wants_ane = False                    # decided once the song's length is known
         self.program_ready = threading.Event()    # its Neural Engine program is compiled
         self.program_failed = False
-        self.migrate = False                      # the scheduler granted it the Neural Engine mid-solve
+        self.migrate = None                       # "ane" / "remote": granted that engine mid-solve
         self.migrated = False
+        self.remote_failed = False                # the iPhone could not run this song's length
 
     @property
     def label(self):
@@ -275,6 +328,7 @@ class Scheduler:
         self.token_batch = None                   # songs tokenizing together on the GPU
         self.gpu_synth = None                     # song synthesizing on the GPU
         self.ane_synth = None                     # song on the Neural Engine (or granted it)
+        self.remote_synth = None                  # song on the iPhone (or granted it)
         self.render = None                        # song rendering on the GPU
         self.ane_prefill = False                  # the Neural Engine song is briefly on the GPU (prefill)
 
@@ -291,7 +345,7 @@ class Scheduler:
             if song not in self.songs:
                 return
             self.songs.remove(song)
-            for slot in ("gpu_synth", "ane_synth", "render"):
+            for slot in ("gpu_synth", "ane_synth", "remote_synth", "render"):
                 if getattr(self, slot) is song:
                     setattr(self, slot, None)
             empty = not self.songs
@@ -347,7 +401,7 @@ class Scheduler:
         live = sorted(self.songs, key=lambda s: s.priority)
         def first(state, ok=lambda s: True):
             return next((s for s in live if s.state == state and not s.cancel.is_set() and ok(s)), None)
-        running = any(x is not None for x in (self.token_batch, self.gpu_synth, self.ane_synth, self.render))
+        running = any(x is not None for x in (self.token_batch, self.gpu_synth, self.ane_synth, self.remote_synth, self.render))
         starts = []
 
         # Neural Engine: the highest-priority song that wants it, whether waiting or already on the GPU.
@@ -357,10 +411,23 @@ class Scheduler:
             movable = g if (g is not None and g.wants_ane and g.program_ready.is_set() and not g.migrate and not g.cancel.is_set()) else None
             best = min((s for s in (waiting, movable) if s is not None), key=lambda s: s.priority, default=None)
             if best is not None and best is movable:
-                best.migrate = True; self.ane_synth = best          # picked up at its next step boundary
+                best.migrate = "ane"; self.ane_synth = best         # picked up at its next step boundary
             elif best is not None:
                 self.ane_synth = best; best.state = SYNTHING
                 starts.append((run_ane, best))
+                running = True
+
+        # iPhone: the next song allowed a Neural Engine that the phone can hold, waiting or on the GPU.
+        if REMOTE is not None and self.remote_synth is None and (CONCURRENT or not running):
+            waiting = first(SYNTH_WAIT, lambda s: remote_can_take(s) and s is not self.ane_synth)
+            g = self.gpu_synth
+            movable = g if (g is not None and remote_can_take(g) and not g.migrate and not g.cancel.is_set() and g is not self.ane_synth) else None
+            best = min((s for s in (waiting, movable) if s is not None), key=lambda s: s.priority, default=None)
+            if best is not None and best is movable:
+                best.migrate = "remote"; self.remote_synth = best
+            elif best is not None:
+                self.remote_synth = best; best.state = SYNTHING
+                starts.append((run_remote, best))
                 running = True
 
         # Rendering: always admitted (tiles interleave with token steps; a GPU synthesis pauses for it).
@@ -658,6 +725,61 @@ def run_ane(song):
         fail(song, exc)
 
 
+def run_remote(song):
+    """Synthesize on the iPhone's Neural Engine (the prefix prefill still runs on the GPU)."""
+    from yue2.nar import synthesize
+    from yue2.remote.protocol import RemoteError
+    client = REMOTE
+    def release():
+        with SCHED.cv:
+            if SCHED.remote_synth is song:
+                SCHED.remote_synth = None
+            SCHED.ane_prefill = False
+    try:
+        pipe, model = acquire_model()
+        kwargs, audio_s, _ = synth_common(song, model, pipe)
+        if client is None:
+            raise RemoteError("the iPhone is no longer connected")
+        log(f"Synthesizing {song.label} on {client.label()}: about {audio_s:.0f} s of audio, {song.quality} quality ({song.steps} steps)")
+        song.set_state(SYNTHING, "preparing", engine="remote")
+        def on_phase(text):
+            song.progress(0.0, text)
+            with SCHED.cv:
+                SCHED.ane_prefill = text.startswith("prefilling")
+            SCHED.tick()
+        kwargs["on_phase"] = on_phase
+        song.used_engine = "remote"
+        t0 = time.perf_counter()
+        try:
+            latents = synthesize(model, song.plan.prefix, song.codec, song.seed, engine="remote", remote=client,
+                                 offload_ar=pipe.offload_ar, **kwargs)
+        except (RemoteError, OSError) as exc:
+            reason = str(exc).splitlines()[0][:120]
+            if isinstance(exc, OSError) or "closed the connection" in reason:
+                clear_remote(reason)
+            else:
+                song.remote_failed = True
+                log(f"{client.label()} cannot run {song.label} ({reason}); it will use the Mac")
+            release()
+            song.set_state(SYNTH_WAIT, "waiting", engine="ane" if song.wants_ane else "mlx")
+            SCHED.tick(); return
+        song.latents = latents.detach().float().cpu().numpy()
+        song.nar_seconds = time.perf_counter() - t0
+        log(f"Synthesis of {song.label} done in {song.nar_seconds:.0f} s ({song.nar_seconds / audio_s:.1f} s per second of audio, "
+            f"{song.steps} steps, {client.label()})")
+        release()
+        if song.cancel.is_set():
+            SCHED.finish(song, CANCELLED, "stopped"); return
+        song.set_state(RENDER_WAIT, "waiting", engine="remote")
+        SCHED.tick()
+    except InterruptedError:
+        release()
+        SCHED.finish(song, CANCELLED, "stopped")
+    except Exception as exc:
+        release()
+        fail(song, exc)
+
+
 def run_gpu(song):
     """Synthesize on the GPU (MLX). A full-quality song moves to the Neural Engine when the
     scheduler grants it, and pauses between steps whenever the GPU is wanted elsewhere."""
@@ -668,16 +790,18 @@ def run_gpu(song):
         kwargs["on_phase"] = lambda text: song.progress(0.0, text)
         song.used_engine = "mlx"
         t0 = time.perf_counter()
-        movable = song.wants_ane
+        movable = song.wants_ane or remote_can_take(song)
+        where = "the Neural Engine" if song.wants_ane else "the iPhone"
         if movable:
-            log(f"Synthesizing {song.label} on the GPU until the Neural Engine is granted: about {audio_s:.0f} s of audio ({song.steps} steps)")
-            song.set_state(SYNTHING, "on the GPU · moves to the Neural Engine when granted", engine="mlx")
-            precompile(song, model, "for the move")
+            log(f"Synthesizing {song.label} on the GPU until {where} is granted: about {audio_s:.0f} s of audio ({song.steps} steps)")
+            song.set_state(SYNTHING, f"on the GPU · moves to {where} when granted", engine="mlx")
+            if song.wants_ane:
+                precompile(song, model, "for the move")
             SCHED.tick()                                   # the program may already be compiled
         else:
             log(f"Synthesizing {song.label} on the GPU: about {audio_s:.0f} s of audio, {song.quality} quality ({song.steps} steps)")
             song.set_state(SYNTHING, "preparing", engine="mlx")
-        idle_text = "on the GPU · moves to the Neural Engine when granted" if movable else "on the GPU"
+        idle_text = f"on the GPU · moves to {where} when granted" if movable else "on the GPU"
         paused = [False]
         def should_wait():
             # Tokenizing, rendering and the Neural Engine song's prefill own the GPU: MLX's long
@@ -693,19 +817,20 @@ def run_gpu(song):
                     log(f"{song.label} resumes on the GPU")
                     song.set_state(SYNTHING, idle_text, engine="mlx")
             return busy
-        def on_switch(step):
-            song.migrated = True; song.used_engine = "ane"
-            log(f"{song.label} moved to the Neural Engine at solver step {step}/{song.steps}")
-            song.set_state(SYNTHING, f"moved to the Neural Engine at step {step}", engine="ane")
+        def on_switch(step, kind):
+            moved_to = "the Neural Engine" if kind == "ane" else "the iPhone"
+            song.migrated = True; song.used_engine = kind
+            log(f"{song.label} moved to {moved_to} at solver step {step}/{song.steps}")
+            song.set_state(SYNTHING, f"moved to {moved_to} at step {step}", engine=kind)
             with SCHED.cv:
                 if SCHED.gpu_synth is song:
                     SCHED.gpu_synth = None                   # the GPU is free for the next song
-            trim_gpu_memory(model, "moved to the Neural Engine")
+            trim_gpu_memory(model, f"moved to {moved_to}")
             SCHED.tick()
         latents, used, switched_at = synthesize_switchable(model, song.plan.prefix, song.codec, song.seed,
                                                            may_switch=(lambda: song.migrate) if movable else None,
-                                                           should_wait=should_wait, on_switch=on_switch, **kwargs)
-        song.used_engine = "mlx+ane" if switched_at is not None else "mlx"
+                                                           should_wait=should_wait, on_switch=on_switch, remote=REMOTE, **kwargs)
+        song.used_engine = f"mlx+{used}" if switched_at is not None else "mlx"
         song.latents = latents.detach().float().cpu().numpy()
         song.nar_seconds = time.perf_counter() - t0
         log(f"Synthesis of {song.label} done in {song.nar_seconds:.0f} s ({song.nar_seconds / audio_s:.1f} s per second of audio, "
@@ -715,6 +840,8 @@ def run_gpu(song):
                 SCHED.gpu_synth = None
             if SCHED.ane_synth is song:
                 SCHED.ane_synth = None
+            if SCHED.remote_synth is song:
+                SCHED.remote_synth = None
         trim_gpu_memory(model, "GPU synthesis finished")
         if song.cancel.is_set():
             SCHED.finish(song, CANCELLED, "stopped"); return
@@ -1051,6 +1178,8 @@ def main():
                 SCHED.cancel(song)
         elif cmd in ("generate", "render"):
             threading.Thread(target=submit, args=(req,), daemon=True).start()     # never block the command loop on a model load
+        elif cmd == "remote":
+            threading.Thread(target=set_remote, args=(req,), daemon=True).start()
         elif cmd == "transcribe":
             threading.Thread(target=run_transcribe, args=(req,), daemon=True).start()
         elif cmd == "transcribe_cancel":
