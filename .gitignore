@@ -25,6 +25,7 @@ runs/
 # Apple Silicon fork: build products, generated artefacts, local data
 outputs/
 dist/
+releases/
 build/
 app/YuEStudio/.build/
 *.dmg

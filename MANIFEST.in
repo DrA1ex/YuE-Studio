@@ -4,7 +4,7 @@ recursive-include docs *.md *.csv
 recursive-include examples *.py *.json *.abc *.txt *.md
 recursive-include skills *.md *.py *.json *.yaml LICENSE
 recursive-include tests *.py
-recursive-include tools *.py
+recursive-include tools *.py *.txt
 recursive-include assets *.png *.svg
 global-exclude __pycache__ *.py[cod]
 prune .venv*

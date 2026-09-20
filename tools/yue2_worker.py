@@ -15,7 +15,8 @@ the whole policy; in short:
   Rendering       always admitted: its tiles interleave with token steps.
 
 Requests: {"cmd": "generate", "style", "lyrics", "cot": "full|melody|off", "seed", "random_seed", "batch",
-           "max_tokens", "abc": str|null, "quality": "draft|full", "draft_steps", "instrumental": bool}
+           "max_tokens", "abc": str|null, "quality": "draft|full", "draft_steps", "instrumental": bool,
+           "prompt_fidelity", "style_fidelity", "source_fidelity", "target_seconds"}
           {"cmd": "render", "path": song directory or its audio.flac, "quality": "full|draft"}
           {"cmd": "cancel", "path"}   {"cmd": "stop"}   {"cmd": "ping"}   {"cmd": "quit"}
 Events:   {"event": "ready"}   {"event": "log", "message"}   {"event": "pong"}   {"event": "error", "message"}
@@ -37,6 +38,7 @@ OUTPUT_DIR = Path(os.environ.get("YUE2_OUTPUT_DIR", ROOT / "outputs" / "app"))
 PIPE = None
 LOCK = threading.Lock()                              # stdout
 MODEL_LOCK = threading.Lock()                        # model load/unload and memory release
+SUBMIT_LOCK = threading.Lock()                       # preserve admission and unique run directories
 IDLE_UNLOAD_S = float(os.environ.get("YUE2_IDLE_UNLOAD_S", 600))   # drop the model after this long idle (reloads in ~1 s)
 LAST_ACTIVE = [time.time()]
 PHYSICAL_GIB = float(os.environ.get("YUE2_PHYSICAL_GIB") or os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30)
@@ -211,12 +213,15 @@ class Song:
     """One song on its way through the stages: a process with a priority (its arrival number)."""
     _sequence = itertools.count(1)
 
-    def __init__(self, run, index, seed, request, directory, quality, steps, limit, instrumental=False):
+    def __init__(self, run, index, seed, request, directory, quality, steps, limit, instrumental=False,
+                 title="", kind="GENERATED", source_path=None, min_tokens=200, temperature=1.0, top_p=0.95):
         self.priority = next(Song._sequence)
         self.run, self.index, self.seed, self.request = run, index, seed, request
         self.directory = Path(directory)
         self.path = str(self.directory / "audio.flac")
         self.quality, self.steps, self.limit, self.instrumental = quality, steps, limit, instrumental
+        self.title, self.kind, self.source_path = title, kind, source_path
+        self.min_tokens, self.temperature, self.top_p = int(min_tokens), float(temperature), float(top_p)
         self.mode = request.cot
         self.needs_plan = request.cot != "off" and request.abc is None
         self.cancel = threading.Event()
@@ -412,6 +417,9 @@ def save_tokens(song):
     song.plan.save(song.directory)
     np.save(song.directory / "semantic.npy", np.asarray(song.codec, dtype=np.int32))
     write_json(song.directory / "request.json", song.request.to_dict())
+    write_json(song.directory / "metadata.json", {"title": song.title or f"Song {song.index}",
+                                                   "style": song.request.style, "kind": song.kind,
+                                                   "source_path": song.source_path})
     write_json(song.directory / "tokens.json", {"seed": song.seed, "frames": len(song.codec), "quality": song.quality,
                                                "steps": song.steps, "priority": song.priority, "truncated": bool(song.truncated),
                                                "timing": song.timing})
@@ -432,7 +440,9 @@ def run_batch(batch):
                 for s in sorted(SCHED.songs, key=lambda s: s.priority):
                     if len(songs) >= MAX_BATCH:
                         break
-                    if s.state == QUEUED and not s.cancel.is_set() and s.mode == songs[0].mode and s.needs_plan == songs[0].needs_plan and s not in songs:
+                    if (s.state == QUEUED and not s.cancel.is_set() and s.mode == songs[0].mode
+                            and s.needs_plan == songs[0].needs_plan and s.min_tokens == songs[0].min_tokens
+                            and s.temperature == songs[0].temperature and s.top_p == songs[0].top_p and s not in songs):
                         s.state = PLANNING if s.needs_plan else TOKENIZING
                         songs.append(s)
                 SCHED.token_batch = songs
@@ -490,7 +500,9 @@ def run_batch(batch):
         for s in songs:
             s.set_state(TOKENIZING, "generating song tokens")
         limits = [s.limit for s in songs]
-        sampling = dataclasses.replace(pipe.generation_config.semantic, max_tokens=max(limits))
+        sampling = dataclasses.replace(pipe.generation_config.semantic, max_tokens=max(limits),
+                                       min_tokens=songs[0].min_tokens, temperature=songs[0].temperature,
+                                       top_p=songs[0].top_p)
 
         released = set()
         def release_song(i, tokens, t, truncated):
@@ -750,7 +762,8 @@ def run_render(song):
         length = len(audio) / 48000
         log(f"Saved {directory / 'audio.flac'} ({length:.1f} s, {song.quality})")
         emit(event="song", index=song.index, path=song.path, score=plan.abc or "", seconds=round(length, 1), seed=song.seed,
-             truncated=bool(song.truncated or plan.truncated), quality=song.quality, steps=song.steps, engine=song.used_engine)
+             truncated=bool(song.truncated or plan.truncated), quality=song.quality, steps=song.steps, engine=song.used_engine,
+             title=song.title, style=song.request.style, lyrics=song.request.lyrics, kind=song.kind, source_path=song.source_path)
         SCHED.finish(song, DONE)
     except InterruptedError:
         SCHED.finish(song, CANCELLED, "stopped")
@@ -772,7 +785,14 @@ def steps_for(quality, req):
 def submit_generate(req):
     from yue2.protocol import SongRequest
     n = int(req.get("batch", 1)); mode = req.get("cot", "full")
-    style, lyrics = req["style"].strip(), req["lyrics"].strip()
+    style, lyrics = str(req.get("style") or "").strip(), str(req.get("lyrics") or "").strip()
+    kind = str(req.get("kind") or "GENERATED")
+    if not 1 <= n <= 8:
+        raise ValueError("Variants must be between 1 and 8")
+    if not style and kind != "COVER":
+        raise ValueError("Enter a musical style")
+    if not lyrics and not req.get("instrumental"):
+        raise ValueError("Enter lyrics or select Instrumental")
     instrumental = bool(req.get("instrumental"))
     if instrumental:
         from yue2.instrumental import instrumental_tags, structure_only
@@ -783,6 +803,19 @@ def submit_generate(req):
     base = int(time.time()) % 10_000_000 if req.get("random_seed") else int(req.get("seed", 831001))
     seeds = [base + i for i in range(n)]
     abc = (req.get("abc") or "").strip() or None
+    source_fidelity = max(0.0, min(float(req.get("source_fidelity", 1.0)), 1.0))
+    prompt_fidelity = max(0.0, min(float(req.get("prompt_fidelity", 0.75)), 1.0))
+    style_fidelity = max(0.0, min(float(req.get("style_fidelity", 0.75)), 1.0))
+    if kind == "COVER":
+        from cover_score import prepare_cover_score
+        if abc and source_fidelity > 0.0:
+            abc = prepare_cover_score(abc)
+        elif source_fidelity <= 0.0:
+            abc = None
+        mode = "melody"
+    if instrumental and abc:
+        from yue2.instrumental import silence_vocals
+        abc = silence_vocals(abc)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out_root = OUTPUT_DIR / stamp
     with SCHED.cv:
@@ -790,14 +823,28 @@ def submit_generate(req):
     while out_root in taken or out_root.exists():                                      # two jobs in one second
         stamp += "b"; out_root = OUTPUT_DIR / stamp
     steps = steps_for(quality, req)
-    limit = max(1, min(int(req.get("max_tokens", 9000)), 9000))
+    target_seconds = float(req.get("target_seconds") or 0)
+    if kind == "COVER" and target_seconds > 0:
+        limit = max(1, min(int(round(target_seconds * 25)), 9000))
+        min_tokens = max(1, limit - 2)
+    else:
+        limit = max(1, min(int(req.get("max_tokens", 9000)), 9000))
+        min_tokens = min(200, limit)
+    # Higher fidelity reduces sampling freedom; source fidelity contributes only for covers.
+    temperature = max(0.55, min(1.25, 1.20 - 0.35 * prompt_fidelity - (0.20 * source_fidelity if kind == "COVER" else 0.0)))
+    top_p = max(0.80, min(0.99, 0.99 - 0.14 * style_fidelity))
     songs = []
     for i, seed in enumerate(seeds):
         request = SongRequest(style=style, lyrics=lyrics, cot=mode, seed=seed, abc=abc,
                               id=f"song{i + 1}", **({"cfg_scale": 1.0} if mode == "off" else {}))
-        songs.append(Song(stamp, i + 1, seed, request, out_root / f"song{i + 1}", quality, steps, limit, instrumental))
-    emit(event="started", job=stamp, output=str(out_root),
-         songs=[{"index": s.index, "seed": s.seed, "path": s.path, "priority": s.priority} for s in songs])
+        songs.append(Song(stamp, i + 1, seed, request, out_root / f"song{i + 1}", quality, steps, limit, instrumental,
+                          title=str(req.get("title") or f"Song {i + 1}"), kind=kind,
+                          source_path=req.get("source_path"), min_tokens=min_tokens,
+                          temperature=temperature, top_p=top_p))
+    emit(event="started", job=stamp, output=str(out_root), request_id=req.get("request_id"),
+         songs=[{"index": s.index, "seed": s.seed, "path": s.path, "priority": s.priority,
+                  "title": s.title, "style": s.request.style, "lyrics": s.request.lyrics,
+                  "quality": s.quality, "kind": s.kind, "source_path": s.source_path} for s in songs])
     log(f"Queued {stamp}: {n} song(s), {quality} quality ({steps} steps), seeds {seeds}, priorities {[s.priority for s in songs]}"
         + (", instrumental" if instrumental else ""))
     SCHED.submit(songs)
@@ -812,7 +859,7 @@ def submit_render(req):
     if directory.is_file():
         directory = directory.parent
     if SCHED.find(str(directory / "audio.flac")) is not None:
-        emit(event="error", message=f"{directory.name} is already queued"); return
+        raise ValueError(f"{directory.name} is already queued")
     quality = "draft" if req.get("quality", "full") == "draft" else "full"
     plan = SymbolicPlan.load(directory)
     codec = np.load(directory / "semantic.npy", allow_pickle=False).astype(int).tolist()
@@ -823,23 +870,31 @@ def submit_render(req):
     truncated = previous.get("truncated")
     truncated = bool(truncated.get("semantic", False) if isinstance(truncated, dict) else truncated)
     index = int(directory.name[4:]) if directory.name.startswith("song") and directory.name[4:].isdigit() else 1
-    song = Song(directory.parent.name, index, plan.request.seed, plan.request, directory, quality, steps_for(quality, req), 9000)
+    metadata = {}
+    if (directory / "metadata.json").exists():
+        metadata = json.loads((directory / "metadata.json").read_text())
+    song = Song(directory.parent.name, index, plan.request.seed, plan.request, directory, quality, steps_for(quality, req), 9000,
+                title=metadata.get("title", f"Song {index}"), kind=metadata.get("kind", "GENERATED"),
+                source_path=metadata.get("source_path"))
     song.plan, song.codec, song.truncated = plan, codec, truncated
     song.timing = previous.get("timing", {}) if "frames" in previous else {}
     song.decide_engine()
     song.state = SYNTH_WAIT
-    emit(event="started", job=directory.parent.name, output=str(directory.parent),
-         songs=[{"index": index, "seed": song.seed, "path": song.path, "priority": song.priority}])
+    emit(event="started", job=directory.parent.name, output=str(directory.parent), request_id=req.get("request_id"),
+         songs=[{"index": index, "seed": song.seed, "path": song.path, "priority": song.priority,
+                 "title": song.title, "style": song.request.style, "lyrics": song.request.lyrics,
+                 "quality": song.quality, "kind": song.kind, "source_path": song.source_path}])
     log(f"Queued {song.label} for {quality} synthesis ({song.steps} steps, priority {song.priority}): about {len(codec) / 25:.0f} s of audio")
     SCHED.submit([song])
 
 
 def submit(req):
     try:
-        (submit_render if req.get("cmd") == "render" else submit_generate)(req)
+        with SUBMIT_LOCK:
+            (submit_render if req.get("cmd") == "render" else submit_generate)(req)
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)
-        log(f"Error: {type(exc).__name__}: {exc}"); emit(event="error", message=f"{type(exc).__name__}: {exc}")
+        log(f"Error: {type(exc).__name__}: {exc}"); emit(event="error", message=f"{type(exc).__name__}: {exc}", request_id=req.get("request_id"))
 
 
 # ── Memory ───────────────────────────────────────────────────────────────────
@@ -937,7 +992,7 @@ def main():
             else:
                 SCHED.cancel(song)
         elif cmd in ("generate", "render"):
-            threading.Thread(target=submit, args=(req,), daemon=True).start()     # never block the command loop on a model load
+            submit(req)  # Admission is ordered; model execution remains on scheduler threads.
         else:
             emit(event="error", message=f"unknown command {cmd}")
 

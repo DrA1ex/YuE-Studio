@@ -24,7 +24,7 @@ Engine busy at the same time, and the engines that make the model run well on Ap
 comfortable, 16 GB works (the worker adapts). About 10 GB of disk.
 
 **Install.** Download `YuE-Studio.dmg` from the
-[Releases](https://github.com/tonywestonuk/YuE-Studio/releases) page, drag the app to
+[Releases](https://github.com/dre4moff/YuE-Studio/releases) page, drag the app to
 Applications, launch it and press Install.
 
 ## Under the hood
@@ -60,8 +60,16 @@ yue2 generate --request examples/song.json --device mps --output outputs/first-s
 cd app/YuEStudio && swift run                        # the app, using this checkout's worker
 ```
 
-`bash app/package.sh` builds the app bundle and a DMG (ad hoc signed by default; set
-`SIGN_IDENTITY` and `NOTARY_PROFILE` for a notarized build).
+`bash app/package.sh` builds the app bundle and a DMG under `releases/` (ad hoc signed by default;
+set `SIGN_IDENTITY` and `NOTARY_PROFILE` for a notarized build). The app icon is compiled directly
+from `icons/YuE_icon.icon`, the Icon Composer document kept in the project.
+Use `bash app/package.sh --app-only` to build only `releases/YuE Studio.app`.
+Future automated DMGs use `icons/DMG_Back.png` through `app/create_dmg.sh`;
+Finder configures the installer background and drag-to-Applications layout.
+
+This fork adds a redesigned studio UI, source-audio covers, local lyric and style
+analysis, library prompt reuse, and robust Whisper alignment recovery. See
+[Audio analysis](docs/audio-analysis.md) for behavior, validation and limitations.
 
 ## Licence
 
