@@ -42,8 +42,12 @@ struct Paths {
     }
     static var imports: URL { output.appendingPathComponent("Imports", isDirectory: true) }
     static var coverSupport: URL { support.appendingPathComponent("cover-runtime", isDirectory: true) }
+    static var coverAnalyses: URL { coverSupport.appendingPathComponent("analyses", isDirectory: true) }
     static var coverPython: URL { coverSupport.appendingPathComponent("env/bin/python") }
+    static var coverWhisperPython: URL { coverSupport.appendingPathComponent("whisper-env/bin/python") }
     static var coverRequirements: URL { packaged ? src.appendingPathComponent("tools/sheetsage-requirements.txt") : repoRoot.appendingPathComponent("tools/sheetsage-requirements.txt") }
+    static var coverWhisperRequirements: URL { packaged ? src.appendingPathComponent("tools/whisper-requirements.txt") : repoRoot.appendingPathComponent("tools/whisper-requirements.txt") }
+    static var coverSeparationModel: URL { coverSupport.appendingPathComponent("torch/torchaudio/models/hdemucs_high_musdbhq_only.pt") }
     static var installedMarker: URL { support.appendingPathComponent("installed.json") }
     static var bundledVersion: String { (try? String(contentsOf: payload!.appendingPathComponent("version.txt"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "dev" }
     static var workerEnvironment: [String: String] {
@@ -385,9 +389,12 @@ final class Backend: ObservableObject {
     @Published var audioSources: [AudioSource] = []
     @Published var busy = false                  // anything queued or in a stage
     @Published var connected = false
-    @Published var coverLyricsReady = FileManager.default.fileExists(atPath: Paths.coverSupport.appendingPathComponent("installed-v5").path)
-    @Published var coverStyleReady = FileManager.default.fileExists(atPath: Paths.coverSupport.appendingPathComponent("installed-v4").path)
-    @Published var coverReady = FileManager.default.fileExists(atPath: Paths.coverSupport.appendingPathComponent("installed-v3").path)
+    @Published var coverLyricsReady = CoverComponent.lyrics.isInstalled
+    @Published var coverStyleReady = CoverComponent.style.isInstalled
+    @Published var coverReady = CoverComponent.melody.isInstalled
+    @Published var coverMlxReady = CoverComponent.mlxWhisper.isInstalled && FileManager.default.isExecutableFile(atPath: Paths.coverWhisperPython.path)
+    @Published var coverSeparationReady = CoverComponent.vocalActivity.isInstalled
+    @Published var coverComponents: [CoverComponent: Bool] = Dictionary(uniqueKeysWithValues: CoverComponent.allCases.map { ($0, $0.isInstalled) })
     @Published var coverBusy = false
     @Published var coverStatus = ""
     @Published var errorMessage: String?
@@ -398,6 +405,19 @@ final class Backend: ObservableObject {
     private var pendingRenders: [String: String] = [:]
 
     var coverRuntimeReady: Bool { coverReady && FileManager.default.isExecutableFile(atPath: Paths.coverPython.path) }
+
+    func coverComponentReady(_ component: CoverComponent) -> Bool {
+        coverComponents[component] ?? component.isInstalled
+    }
+
+    func refreshCoverInstallationState() {
+        coverComponents = Dictionary(uniqueKeysWithValues: CoverComponent.allCases.map { ($0, $0.isInstalled) })
+        coverReady = coverComponents[.melody] == true
+        coverStyleReady = coverComponents[.style] == true
+        coverLyricsReady = coverComponents[.lyrics] == true
+        coverMlxReady = coverComponents[.mlxWhisper] == true && FileManager.default.isExecutableFile(atPath: Paths.coverWhisperPython.path)
+        coverSeparationReady = coverComponents[.vocalActivity] == true
+    }
 
     var process: Process?
     private var stdin: FileHandle?
@@ -681,6 +701,24 @@ final class Backend: ObservableObject {
     func cancel(_ song: Song) { send(["cmd": "cancel", "path": song.path]) }
     func stop() { cancelCover(); if process != nil { send(["cmd": "stop"]); append("Stop sent") } }
     func quit() { shuttingDown = true; cancelCover(); if process != nil { send(["cmd": "quit"]); process?.terminate() } }
+
+    /// Remove reusable evidence only. The source audio, generated songs and
+    /// imported metadata remain in place; the next cover analysis recomputes
+    /// every stage from the melody pass.
+    func clearCoverAnalysisCache() {
+        guard !busy, !coverBusy else { report("Wait until generation and audio analysis have finished."); return }
+        let cache = Paths.coverAnalyses
+        guard FileManager.default.fileExists(atPath: cache.path) else {
+            append("No previous audio analyses to clear")
+            return
+        }
+        do {
+            try FileManager.default.trashItem(at: cache, resultingItemURL: nil)
+            append("Previous audio analysis data moved to Trash")
+        } catch {
+            report("Could not clear previous audio analyses: \(error.localizedDescription)")
+        }
+    }
 }
 
 // MARK: - Audio
@@ -737,6 +775,7 @@ struct ContentView: View {
     @State private var search = ""
     @State private var filter = "All"
     @State private var sortNewest = true
+    @State private var confirmClearAnalysis = false
     @Environment(\.openSettings) private var openSettings
     @State private var showOptions = false
     @State private var lyricsExpanded = true
@@ -792,6 +831,12 @@ struct ContentView: View {
         .alert("YuE Studio", isPresented: Binding(get: { backend.errorMessage != nil }, set: { if !$0 { backend.errorMessage = nil } })) {
             Button("OK") { backend.errorMessage = nil }
         } message: { Text(backend.errorMessage ?? "") }
+        .alert("Clear previous audio analyses?", isPresented: $confirmClearAnalysis) {
+            Button("Cancel", role: .cancel) { }
+            Button("Move to Trash", role: .destructive) { backend.clearCoverAnalysisCache() }
+        } message: {
+            Text("Reusable melody, lyric, genre and style evidence will be removed. The next analysis will start from zero; songs and source audio stay in the library.")
+        }
         .sheet(isPresented: $showLyricsEditor) {
             VStack(alignment: .leading, spacing: 14) {
                 Text("Lyrics").font(.title2).bold()
@@ -978,11 +1023,27 @@ struct ContentView: View {
                     if !transcriptionError.isEmpty { Text(transcriptionError).foregroundStyle(.red).font(.caption).lineLimit(2) }
                 }
             }
-            ForEach(analysisWarnings, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+            ForEach(analysisWarnings, id: \.self) { Text(friendlyAnalysisWarning($0)).font(.caption).foregroundStyle(.secondary) }
             if !suggestedGenre.isEmpty {
                 HStack { Label("Suggested style: \(suggestedGenre)", systemImage: "sparkles").font(.caption).foregroundStyle(.secondary); Spacer(); Button("Use") { style = suggestedGenre }.controlSize(.small) }
             }
         }.padding(14).background(card, in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private func friendlyAnalysisWarning(_ warning: String) -> String {
+        if warning.localizedCaseInsensitiveContains("Word alignment") {
+            return "Lyric timing is approximate; the recognized text was kept."
+        }
+        if warning.localizedCaseInsensitiveContains("sections are inferred") {
+            return "Section labels are suggestions based on repetition and position; review them before generating."
+        }
+        if warning.localizedCaseInsensitiveContains("digital silence") {
+            return "Very quiet timestamps were omitted; the raw transcription remains available in the import metadata."
+        }
+        if warning.localizedCaseInsensitiveContains("style model unavailable") {
+            return "Detailed style analysis is unavailable until the cover engine is repaired."
+        }
+        return warning
     }
 
     private var libraryPane: some View {
@@ -996,6 +1057,21 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(spacing: 2) { ForEach(filteredSongs) { song in libraryRow(song) } }
             }.overlay { if filteredSongs.isEmpty { Text(backend.songs.isEmpty ? "Your songs will appear here" : "No songs match this search or filter").foregroundStyle(.secondary) } }
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.counterclockwise")
+                    .foregroundStyle(.secondary)
+                Text("Need a clean re-analysis? Clear the previous audio-analysis data below.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer()
+                Button("Clear analysis data…") { confirmClearAnalysis = true }
+                    .buttonStyle(.bordered)
+                    .disabled(backend.busy || backend.coverBusy)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 12)
+            .background(card.opacity(0.75))
         }
     }
 
@@ -1090,7 +1166,9 @@ struct ContentView: View {
             switch result {
             case .success(let analysis):
                 self.source?.score = analysis.score; abc = analysis.score
-                if !analysis.lyrics.isEmpty { lyrics = analysis.lyrics; self.source?.lyrics = analysis.lyrics }
+                if !analysis.lyrics.isEmpty && lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    lyrics = analysis.lyrics; self.source?.lyrics = analysis.lyrics
+                }
                 analysisWarnings = analysis.warnings
                 suggestedGenre = analysis.genre
                 if style.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !analysis.genre.isEmpty { style = analysis.genre }

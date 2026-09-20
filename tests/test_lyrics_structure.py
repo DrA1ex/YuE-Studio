@@ -9,7 +9,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from lyrics_structure import format_lyrics
-from transcribe_cover import (filter_silent_words, resolve_whisper_model,
+from transcribe_cover import (_merge_transcription_results, filter_silent_words, resolve_whisper_model, segment_diagnostics,
                              WHISPER_MODEL, WHISPER_REVISION, LEGACY_WHISPER_MODEL)
 
 INTRO = "Across the ocean I hear your call. Before the sunrise we leave it all."
@@ -78,6 +78,23 @@ class LyricStructureTests(unittest.TestCase):
     def test_all_silence_does_not_resurrect_raw_text(self):
         result, _ = filter_silent_words({"chunks": [{"text": "ghost", "timestamp": (0, 1)}], "text": "ghost"}, np.zeros(16000), 16000)
         self.assertEqual(format_lyrics(result), "")
+
+    def test_segment_diagnostics_preserve_invalid_timing_as_evidence(self):
+        diagnostics = segment_diagnostics({"chunks": [
+            {"text": "valid phrase", "timestamp": (1.0, 2.0)},
+            {"text": "uncertain phrase", "timestamp": (None, None)},
+            {"text": "reversed", "timestamp": (4.0, 3.0)},
+        ]})
+        self.assertEqual([item["timestamp_valid"] for item in diagnostics], [True, False, False])
+        self.assertEqual(diagnostics[0]["token_count_estimate"], 2)
+
+    def test_window_merge_offsets_and_deduplicates_overlap(self):
+        merged = _merge_transcription_results([
+            ({"segments": [{"text": "same refrain", "start": 0.0, "end": 2.0}]}, 0.0, 3.0),
+            ({"segments": [{"text": "same refrain", "start": 0.0, "end": 2.0}, {"text": "new line", "start": 2.0, "end": 3.0}]}, 1.5, 4.5),
+        ])
+        self.assertEqual([chunk["text"] for chunk in merged["chunks"]], ["same refrain", "new line"])
+        self.assertEqual(merged["chunks"][1]["timestamp"], (3.5, 4.5))
 
     def test_incomplete_upgrade_falls_back_to_existing_complete_model(self):
         with tempfile.TemporaryDirectory() as directory:

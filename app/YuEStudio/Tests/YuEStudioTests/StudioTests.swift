@@ -41,6 +41,14 @@ final class StudioTests: XCTestCase {
         XCTAssertEqual(buffer.floatChannelData![0][10], Float(sin(1.0)) * 0.5, accuracy: 0.0001)
     }
 
+    func testAnalysisAudioPreservesStereoForSeparation() throws {
+        let root = try fixture(), source = root.appendingPathComponent("stereo.wav"), dest = root.appendingPathComponent("analysis.wav")
+        try writeAudio(source, channels: 2)
+        try AudioPreparation.writeAnalysisAudio(source: source, destination: dest)
+        let audio = try AVAudioFile(forReading: dest)
+        XCTAssertEqual(audio.length, 24000); XCTAssertEqual(audio.processingFormat.channelCount, 2)
+    }
+
     func testImportedMetadataSurvivesRescan() throws {
         let root = try fixture(), imports = root.appendingPathComponent("Imports")
         try FileManager.default.createDirectory(at: imports, withIntermediateDirectories: true)
@@ -94,6 +102,15 @@ final class StudioTests: XCTestCase {
         XCTAssertFalse(Installer.installationIsUsable(pythonPresent: false, modelsPresent: true, installedSchema: Installer.runtimeSchema))
         XCTAssertFalse(Installer.installationIsUsable(pythonPresent: true, modelsPresent: false, installedSchema: Installer.runtimeSchema))
         XCTAssertFalse(Installer.installationIsUsable(pythonPresent: true, modelsPresent: true, installedSchema: Installer.runtimeSchema + 1))
+    }
+
+    func testCoverComponentsHaveIndependentInstallableRoles() {
+        XCTAssertEqual(CoverComponent.allCases.count, 6)
+        XCTAssertEqual(CoverComponent.allCases.filter(\.required).map(\.rawValue), ["melody"])
+        XCTAssertTrue(CoverComponent.mlxWhisper.detail.contains("falls back"))
+        XCTAssertTrue(CoverComponent.genre.detail.contains("excerpts"))
+        XCTAssertNotEqual(CoverComponent.melody.modelPaths, CoverComponent.lyrics.modelPaths)
+        XCTAssertNotEqual(CoverComponent.mlxWhisper.marker, CoverComponent.style.marker)
     }
 
     @MainActor func testInstallCompletionAllowsImmediateAnalysisWithoutClearingNewState() {

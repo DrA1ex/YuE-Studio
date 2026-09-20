@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from audio_analysis import excerpts, format_lyrics, select_descriptors
+from audio_analysis import excerpts, format_lyrics, select_descriptors, summarize_genre
 
 
 class AnalysisTests(unittest.TestCase):
@@ -37,6 +37,15 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(select_descriptors([.1, .03], ["piano", "guitar"]), [])
         self.assertEqual(select_descriptors([.4, .2], ["piano", "guitar"])[0]["label"], "piano")
 
+    def test_close_genre_scores_are_reported_as_hybrid_evidence(self):
+        self.assertEqual(
+            summarize_genre([{"label": "rock", "score": .42}, {"label": "hip_hop", "score": .31}]),
+            "Rock / Hip-Hop",
+        )
+
+    def test_weak_genre_scores_abstain(self):
+        self.assertEqual(summarize_genre([{"label": "rock", "score": .21}]), "Mixed / uncertain")
+
     def test_full_analysis_contract_without_model_weights(self):
         import json
         import tempfile
@@ -46,7 +55,7 @@ class AnalysisTests(unittest.TestCase):
         import transcribe_cover
         recognizer = MagicMock()
         recognizer.alignment_warnings = []
-        recognizer.timestamp_mode = "word"
+        recognizer.timestamp_mode = "segment"
         recognizer.return_value = {"text": "Our song is here.", "chunks": [{"text": "Our song is here.", "timestamp": (0, 1)}]}
         classifier = MagicMock()
         classifier.feature_extractor.sampling_rate = 16000
@@ -68,11 +77,13 @@ class AnalysisTests(unittest.TestCase):
                  patch.object(transcribe_cover, "event"):
                 self.assertEqual(transcribe_cover.main(), 0)
             result = json.loads((root / "out/cover_analysis.json").read_text())
-            self.assertEqual(result["style"], "Hip Hop, deep bass")
+            self.assertEqual(result["style"], "Hip-Hop, deep bass")
             self.assertEqual(result["lyrics"], "[verse]\nOur song is here.")
             self.assertEqual(result["lyrics_raw"], "Our song is here.")
-            self.assertEqual(recognizer.call_args.kwargs["return_timestamps"], "word")
-            self.assertEqual(recognizer.call_args.kwargs["generate_kwargs"]["num_beams"], 3)
+            self.assertEqual(result["lyrics_decoding"]["timestamp_mode"], "segment")
+            self.assertEqual(result["lyrics_segment_diagnostics"][0]["timestamp_valid"], True)
+            self.assertTrue(recognizer.call_args.kwargs["return_timestamps"])
+            self.assertEqual(recognizer.call_args.kwargs["generate_kwargs"]["num_beams"], 1)
             self.assertNotIn("chunk_length_s", recognizer.call_args.kwargs)
             self.assertIsNone(recognizer.generation_config.forced_decoder_ids)
             self.assertEqual(classifier.call_args.kwargs["top_k"], 2)

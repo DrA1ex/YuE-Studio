@@ -12,6 +12,40 @@ STYLE_GROUPS = {
 }
 
 
+def clean_genre_label(label):
+    text = str(label or "").replace("_", " ").replace("-", " ").strip()
+    words = " ".join(part.capitalize() for part in text.split())
+    return words.replace("Hiphop", "Hip-Hop").replace("Hip Hop", "Hip-Hop")
+
+
+def summarize_genre(candidates, excerpt_candidates=None):
+    """Return a cautious label and preserve the uncalibrated evidence.
+
+    GTZAN-style classifier scores are useful for ranking, but they are not
+    probabilities. A close second label is therefore exposed as a hybrid
+    suggestion instead of silently discarded.
+    """
+    ranked = sorted(
+        ({"label": clean_genre_label(item.get("label")), "score": float(item.get("score", 0.0))}
+         for item in candidates if item.get("label")),
+        key=lambda item: item["score"], reverse=True,
+    )
+    if not ranked:
+        return "Mixed / uncertain"
+    top = ranked[0]
+    if top["score"] < 0.28:
+        return "Mixed / uncertain"
+    if len(ranked) > 1:
+        second = ranked[1]
+        if second["score"] >= 0.18 and top["score"] - second["score"] < 0.12:
+            return f"{top['label']} / {second['label']}"
+    if excerpt_candidates:
+        excerpt_winners = [clean_genre_label(items[0]["label"]) for items in excerpt_candidates if items]
+        if excerpt_winners and len(set(excerpt_winners)) > 1:
+            return f"{top['label']} (mixed across sections)"
+    return top["label"]
+
+
 def excerpts(audio, rate, seconds=10, count=3):
     import numpy as np
     length = min(len(audio), int(rate * seconds))
@@ -21,12 +55,25 @@ def excerpts(audio, rate, seconds=10, count=3):
     return [audio[start:start + length] for start in starts]
 
 
-def select_descriptors(scores, labels, minimum=.20, margin=.025):
+def select_descriptors(scores, labels, minimum=.28, margin=.025, support=None, max_items=2):
     """Cosine similarity is evidence, not a calibrated probability."""
     ranked = sorted(zip(labels, map(float, scores)), key=lambda item: item[1], reverse=True)
-    if not ranked or ranked[0][1] < minimum or (len(ranked) > 1 and ranked[0][1] - ranked[1][1] < margin):
+    if not ranked or ranked[0][1] < minimum:
         return []
-    return [{"label": ranked[0][0], "similarity": ranked[0][1]}]
+    if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < margin:
+        return []
+    selected = []
+    for label, score in ranked:
+        index = list(labels).index(label)
+        item_support = float(support[index]) if support is not None else 1.0
+        if score < minimum or item_support < .5:
+            continue
+        if selected and score < ranked[0][1] - .12:
+            continue
+        selected.append({"label": label, "similarity": score, "support": item_support})
+        if len(selected) >= max_items:
+            break
+    return selected
 
 
 def describe_style(audio, rate):
@@ -44,9 +91,12 @@ def describe_style(audio, rate):
             inputs = processor(audios=clip, sampling_rate=rate, return_tensors="pt")
             features = torch.nn.functional.normalize(model.get_audio_features(**inputs), dim=-1)
             similarities.append((features @ text_features.T)[0])
-        scores = torch.stack(similarities).mean(0).tolist()
+        scores = torch.stack(similarities).mean(0).squeeze(0).tolist()
     selected, offset = [], 0
+    per_clip = torch.stack(similarities).squeeze(1).tolist()
     for group in STYLE_GROUPS.values():
-        selected.extend(select_descriptors(scores[offset:offset+len(group)], group))
+        group_scores = scores[offset:offset+len(group)]
+        support = [sum(row[offset + index] >= .28 for row in per_clip) / len(per_clip) for index in range(len(group))]
+        selected.extend(select_descriptors(group_scores, group, support=support))
         offset += len(group)
     return selected

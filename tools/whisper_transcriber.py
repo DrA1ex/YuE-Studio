@@ -56,6 +56,9 @@ class RobustWhisperPipeline(AutomaticSpeechRecognitionPipeline):
                 options["num_frames"] = model_inputs.get("num_frames")
             else:
                 # Bounded recovery: bypass alignment and beam/cache interactions.
+                # `return_legacy_cache` has no meaning when caching is off and
+                # triggers a broken warning call in Transformers 4.45.2.
+                options.pop("return_legacy_cache", None)
                 options.update(num_beams=1, use_cache=False, output_attentions=False,
                                return_dict_in_generate=False)
             return self.model.generate(input_features=features, attention_mask=mask, **options)

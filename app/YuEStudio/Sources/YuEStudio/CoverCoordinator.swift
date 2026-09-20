@@ -12,7 +12,8 @@ extension Backend {
         Paths.workerEnvironment.merging([
             "HF_HOME": Paths.coverSupport.appendingPathComponent("models").path,
             "HF_HUB_DISABLE_XET": "1",
-            "UV_CACHE_DIR": Paths.coverSupport.appendingPathComponent("uv-cache").path
+            "UV_CACHE_DIR": Paths.coverSupport.appendingPathComponent("uv-cache").path,
+            "TORCH_HOME": Paths.coverSupport.appendingPathComponent("torch").path
         ]) { _, new in new }
     }
 
@@ -41,10 +42,12 @@ extension Backend {
                 try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
                 let normalized = output.appendingPathComponent("input.wav")
                 coverStatus = "Decoding source audio…"
-                try await Task.detached(priority: .userInitiated) { try AudioPreparation.writeMono(source: URL(fileURLWithPath: source.path), destination: normalized) }.value
+                try await Task.detached(priority: .userInitiated) { try AudioPreparation.writeAnalysisAudio(source: URL(fileURLWithPath: source.path), destination: normalized) }.value
                 try Task.checkCancellation()
                 coverStatus = "Analyzing melody, lyrics and genre…"
-                try await runCoverCommand(Paths.coverPython.path, ["-u", Paths.transcriber.path, normalized.path, "--output", output.path, "--device", "cpu", "--dtype", "fp32"])
+                var arguments = ["-u", Paths.transcriber.path, normalized.path, "--output", output.path, "--cache-dir", Paths.coverAnalyses.path, "--device", "cpu", "--dtype", "fp32"]
+                if FileManager.default.isExecutableFile(atPath: Paths.coverWhisperPython.path) { arguments += ["--mlx-python", Paths.coverWhisperPython.path] }
+                try await runCoverCommand(Paths.coverPython.path, arguments)
                 try Task.checkCancellation()
                 let score = try String(contentsOf: output.appendingPathComponent("score.abc"), encoding: .utf8)
                 guard !score.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw coverError("The transcriber returned an empty score.") }
@@ -78,37 +81,121 @@ extension Backend {
         }
     }
 
+    /// Install the complete recommended core while keeping MLX and vocal
+    /// activity optional. The per-component entry point below is used by the
+    /// Settings panel when the user wants a smaller installation.
     func installCoverRuntime(completion: @escaping (Result<Void, Error>) -> Void) {
-        guard !coverBusy else { completion(.failure(coverError("Audio analysis engine is busy."))); return }
-        var candidates = ["/opt/homebrew/bin/uv", "/usr/local/bin/uv", NSHomeDirectory() + "/.local/bin/uv"]
-        if let bundled = Paths.payload?.appendingPathComponent("uv").path { candidates.insert(bundled, at: 0) }
-        guard let uv = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            completion(.failure(coverError("uv is required to install the local cover engine."))); return
+        let core: [CoverComponent] = [.melody, .lyrics, .genre, .style]
+        let optional: [CoverComponent] = [.mlxWhisper, .vocalActivity]
+        startCoverInstallation(completion: completion) {
+            let uv = try self.coverUV()
+            for component in core {
+                try await self.installCoverComponentProcess(component, uv: uv)
+                try self.markCoverComponentInstalled(component)
+            }
+            for component in optional {
+                do {
+                    try await self.installCoverComponentProcess(component, uv: uv)
+                    try self.markCoverComponentInstalled(component)
+                } catch {
+                    self.append("\(component.title) unavailable; analysis fallback remains active: \(error.localizedDescription)")
+                }
+            }
+            self.append("Recommended cover components installed")
         }
-        coverBusy = true; coverStatus = "Installing Python 3.11…"
+    }
+
+    func installCoverComponent(_ component: CoverComponent, completion: @escaping (Result<Void, Error>) -> Void) {
+        startCoverInstallation(completion: completion) {
+            let uv = try self.coverUV()
+            try await self.installCoverComponentProcess(component, uv: uv)
+            try self.markCoverComponentInstalled(component)
+            self.append("Installed \(component.title)")
+        }
+    }
+
+    func removeCoverComponent(_ component: CoverComponent, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard !coverBusy, !busy else {
+            completion(.failure(coverError("Audio analysis or generation is busy."))); return
+        }
+        do {
+            let fm = FileManager.default
+            for path in component.modelPaths where fm.fileExists(atPath: path.path) {
+                try fm.trashItem(at: path, resultingItemURL: nil)
+            }
+            for marker in [component.marker] + component.legacyMarkers where fm.fileExists(atPath: marker.path) {
+                try fm.trashItem(at: marker, resultingItemURL: nil)
+            }
+            try Data("removed\n".utf8).write(to: component.disabledMarker, options: .atomic)
+            refreshCoverInstallationState()
+            append("Removed \(component.title) — moved component files to Trash")
+            completion(.success(()))
+        } catch {
+            completion(.failure(coverError("Could not remove \(component.title): \(error.localizedDescription)")))
+        }
+    }
+
+    func clearCoverComponentMarkers() {
+        let fm = FileManager.default
+        let markers = CoverComponent.allCases.flatMap { [$0.marker, $0.disabledMarker] + $0.legacyMarkers }
+            + [Paths.coverSupport.appendingPathComponent("installed-v3"), Paths.coverSupport.appendingPathComponent("installed-v4"), Paths.coverSupport.appendingPathComponent("installed-v5"), Paths.coverSupport.appendingPathComponent("installed-v6")]
+        for marker in markers where fm.fileExists(atPath: marker.path) { try? fm.removeItem(at: marker) }
+        refreshCoverInstallationState()
+    }
+
+    private func startCoverInstallation(completion: @escaping (Result<Void, Error>) -> Void, operation: @escaping () async throws -> Void) {
+        guard !coverBusy else { completion(.failure(coverError("Audio analysis engine is busy."))); return }
+        coverBusy = true; coverStatus = "Preparing component installation…"
         coverTask = Task {
             do {
-                try FileManager.default.createDirectory(at: Paths.coverSupport, withIntermediateDirectories: true)
-                if !FileManager.default.isExecutableFile(atPath: Paths.coverPython.path) {
-                    try await runCoverCommand(uv, ["venv", Paths.coverSupport.appendingPathComponent("env").path, "--python", "3.11"])
-                }
-                coverStatus = "Installing transcription dependencies…"
-                try await runCoverCommand(uv, ["pip", "install", "--python", Paths.coverPython.path, "-r", Paths.coverRequirements.path])
-                coverStatus = "Downloading SheetSage2 and MERT2…"
-                try await runCoverCommand(Paths.coverPython.path, ["-u", Paths.transcriber.path, "--install"])
+                try await operation()
                 try Task.checkCancellation()
-                try Data("ready\n".utf8).write(to: Paths.coverSupport.appendingPathComponent("installed-v3"), options: .atomic)
-                try Data("ready\n".utf8).write(to: Paths.coverSupport.appendingPathComponent("installed-v4"), options: .atomic)
-                try Data("ready\n".utf8).write(to: Paths.coverSupport.appendingPathComponent("installed-v5"), options: .atomic)
-                coverReady = true; coverStyleReady = true; coverLyricsReady = true
-                append("Cover engine installed")
+                refreshCoverInstallationState()
                 finishCoverInstallation(.success(()), completion: completion)
             } catch {
-                let message = Task.isCancelled ? "Installation cancelled; it can be resumed." : "Cover engine installation failed: \(error.localizedDescription)"
+                let message = Task.isCancelled ? "Installation cancelled; it can be resumed." : error.localizedDescription
                 append(message)
                 finishCoverInstallation(.failure(coverError(message)), completion: completion)
             }
         }
+    }
+
+    private func coverUV() throws -> String {
+        var candidates = ["/opt/homebrew/bin/uv", "/usr/local/bin/uv", NSHomeDirectory() + "/.local/bin/uv"]
+        if let bundled = Paths.payload?.appendingPathComponent("uv").path { candidates.insert(bundled, at: 0) }
+        guard let uv = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw coverError("uv is required to install local cover components.")
+        }
+        return uv
+    }
+
+    private func installCoverComponentProcess(_ component: CoverComponent, uv: String) async throws {
+        try FileManager.default.createDirectory(at: Paths.coverSupport, withIntermediateDirectories: true)
+        if component == .mlxWhisper {
+            if !FileManager.default.isExecutableFile(atPath: Paths.coverWhisperPython.path) {
+                coverStatus = "Installing the isolated MLX Whisper environment…"
+                try await runCoverCommand(uv, ["venv", Paths.coverSupport.appendingPathComponent("whisper-env").path, "--python", "3.11"])
+            }
+            coverStatus = "Installing MLX Whisper…"
+            try await runCoverCommand(uv, ["pip", "install", "--python", Paths.coverWhisperPython.path, "-r", Paths.coverWhisperRequirements.path])
+            coverStatus = "Downloading MLX Whisper weights…"
+            try await runCoverCommand(Paths.coverWhisperPython.path, ["-u", Paths.transcriber.path, "--install-component", component.installName])
+            return
+        }
+
+        if !FileManager.default.isExecutableFile(atPath: Paths.coverPython.path) {
+            coverStatus = "Installing the cover Python environment…"
+            try await runCoverCommand(uv, ["venv", Paths.coverSupport.appendingPathComponent("env").path, "--python", "3.11"])
+        }
+        coverStatus = "Checking cover analysis dependencies…"
+        try await runCoverCommand(uv, ["pip", "install", "--python", Paths.coverPython.path, "-r", Paths.coverRequirements.path])
+        coverStatus = "Downloading \(component.title)…"
+        try await runCoverCommand(Paths.coverPython.path, ["-u", Paths.transcriber.path, "--install-component", component.installName])
+    }
+
+    private func markCoverComponentInstalled(_ component: CoverComponent) throws {
+        try? FileManager.default.removeItem(at: component.disabledMarker)
+        try Data("ready\n".utf8).write(to: component.marker, options: .atomic)
     }
 
     /// Release state before calling client code, which may immediately start analysis.
@@ -169,6 +256,26 @@ private final class ProcessLineBuffer: @unchecked Sendable {
 }
 
 enum AudioPreparation {
+    /// Preserve the original channels for source separation. The Python
+    /// analyzer downmixes a separate mono view for SheetSage and Whisper.
+    static func writeAnalysisAudio(source: URL, destination: URL) throws {
+        let input = try AVAudioFile(forReading: source)
+        let format = input.processingFormat
+        guard input.length > 0, format.sampleRate > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 16384) else { throw CocoaError(.fileReadCorruptFile) }
+        let output = try AVAudioFile(forWriting: destination, settings: format.settings)
+        while input.framePosition < input.length {
+            try input.read(into: buffer)
+            guard buffer.frameLength > 0, let channels = buffer.floatChannelData else { throw CocoaError(.fileReadCorruptFile) }
+            for channel in 0..<Int(format.channelCount) {
+                for frame in 0..<Int(buffer.frameLength) {
+                    guard channels[channel][frame].isFinite else { throw CocoaError(.fileReadCorruptFile) }
+                }
+            }
+            try output.write(from: buffer)
+        }
+    }
+
     /// AVFoundation handles local formats; the transcriber receives finite mono PCM samples.
     static func writeMono(source: URL, destination: URL) throws {
         let input = try AVAudioFile(forReading: source)

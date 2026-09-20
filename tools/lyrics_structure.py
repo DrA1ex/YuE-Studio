@@ -27,6 +27,7 @@ def _words(result):
             # chunks provide boundaries, not fabricated word alignment.
             words.append({"text": token, "start": start if index == 0 else None,
                           "end": end if index == len(tokens) - 1 else None,
+                          "segment_start": start, "segment_end": end,
                           "boundary": index == len(tokens) - 1 and len(tokens) > 1})
     return words
 
@@ -100,7 +101,36 @@ def _lines(words):
     return "\n".join(lines)
 
 
-def format_lyrics(result):
+def _span_time(words):
+    starts = [word["segment_start"] for word in words if isinstance(word.get("segment_start"), (int, float))]
+    ends = [word["segment_end"] for word in words if isinstance(word.get("segment_end"), (int, float))]
+    return (min(starts), max(ends)) if starts and ends else (None, None)
+
+
+def _overlap(left, right):
+    if None in (*left, *right):
+        return 0.0
+    length = max(0.0, min(left[1], right[1]) - max(left[0], right[0]))
+    return length / max(0.001, min(left[1] - left[0], right[1] - right[0]))
+
+
+def _acoustic_group_support(group, indexed, words, structure):
+    regions = structure.get("repeated_regions") or []
+    if not regions:
+        return 0.0
+    support = 0.0
+    for start, end in group[1]:
+        left_span = _span_time(words[indexed[start][0]:indexed[end - 1][0] + 1])
+        for region in regions:
+            duration = float(region.get("duration", 0.0))
+            left_region = (float(region.get("left_start", -1.0)), float(region.get("left_start", -1.0)) + duration)
+            right_region = (float(region.get("right_start", -1.0)), float(region.get("right_start", -1.0)) + duration)
+            if max(_overlap(left_span, left_region), _overlap(left_span, right_region)) >= .35:
+                support += float(region.get("similarity", 0.0))
+    return support
+
+
+def format_lyrics(result, acoustic_structure=None):
     words = _words(result)
     if not words:
         return ""
@@ -111,6 +141,12 @@ def format_lyrics(result):
     groups = _passages(keys) if 8 <= len(keys) <= 3000 else []
     if not groups:
         return "[verse]\n" + _lines(words)
+    if acoustic_structure:
+        groups = sorted(
+            groups,
+            key=lambda group: group[0] + 40.0 * _acoustic_group_support(group, indexed, words, acoustic_structure),
+            reverse=True,
+        )
     spans = groups[0][1]
     chorus = [(indexed[start][0], indexed[end - 1][0] + 1) for start, end in spans]
     # Keep punctuation/ad-libs belonging to a refrain inside that refrain.

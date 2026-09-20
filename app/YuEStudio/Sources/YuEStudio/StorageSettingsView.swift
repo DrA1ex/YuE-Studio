@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 
 enum StorageTarget: String, CaseIterable, Identifiable {
-    case mainModels, coverModels, aneCache, coverInstallCache, installCache, sourceCaches
+    case mainModels, coverModels, coverAnalysisCache, aneCache, coverInstallCache, installCache, sourceCaches
 
     var id: String { rawValue }
 
@@ -10,6 +10,7 @@ enum StorageTarget: String, CaseIterable, Identifiable {
         switch self {
         case .mainModels: "YuE2 model"
         case .coverModels: "Cover transcription models"
+        case .coverAnalysisCache: "Cover analysis cache"
         case .aneCache: "Neural Engine cache"
         case .coverInstallCache: "Cover installer cache"
         case .installCache: "Installer cache"
@@ -20,7 +21,8 @@ enum StorageTarget: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .mainModels: "Main generation model. If removed, YuE Studio will ask to download it again before generating."
-        case .coverModels: "SheetSage2, MERT2, Whisper, genre classification and CLAP style analysis."
+        case .coverModels: "SheetSage2, MERT2, Whisper, MLX Whisper, Hybrid Demucs, genre classification and CLAP style analysis."
+        case .coverAnalysisCache: "Resumable melody, lyric, genre and style evidence keyed by source audio."
         case .aneCache: "Compiled Neural Engine programs. They are regenerated automatically when needed."
         case .coverInstallCache: "Temporary package files used by the cover engine installer."
         case .installCache: "Temporary package files used by the main installer."
@@ -33,7 +35,9 @@ enum StorageTarget: String, CaseIterable, Identifiable {
         case .mainModels:
             [Paths.models]
         case .coverModels:
-            [Paths.coverSupport.appendingPathComponent("models")]
+            [Paths.coverSupport.appendingPathComponent("models"), Paths.coverSupport.appendingPathComponent("torch"), Paths.coverSupport.appendingPathComponent("whisper-env")]
+        case .coverAnalysisCache:
+            [Paths.coverAnalyses]
         case .aneCache:
             [Paths.aneCache]
         case .coverInstallCache:
@@ -95,6 +99,7 @@ enum StorageScanner {
 @MainActor
 final class StorageSettingsModel: ObservableObject {
     @Published var sizes: [StorageTarget: Int64] = [:]
+    @Published var componentSizes: [CoverComponent: Int64] = [:]
     @Published var scanning = false
     @Published var deleting: StorageTarget?
     @Published var error: String?
@@ -103,11 +108,15 @@ final class StorageSettingsModel: ObservableObject {
         guard !scanning else { return }
         scanning = true
         let targets = StorageTarget.allCases.map { ($0, $0.paths) }
+        let components = CoverComponent.allCases.map { ($0, $0.modelPaths) }
         Task {
             let measured = await Task.detached(priority: .utility) {
-                Dictionary(uniqueKeysWithValues: targets.map { ($0.0, StorageScanner.allocatedSize(of: $0.1)) })
+                let targetSizes = Dictionary(uniqueKeysWithValues: targets.map { ($0.0, StorageScanner.allocatedSize(of: $0.1)) })
+                let componentSizes = Dictionary(uniqueKeysWithValues: components.map { ($0.0, StorageScanner.allocatedSize(of: $0.1)) })
+                return (targetSizes, componentSizes)
             }.value
-            sizes = measured
+            sizes = measured.0
+            componentSizes = measured.1
             scanning = false
         }
     }
@@ -125,15 +134,8 @@ final class StorageSettingsModel: ObservableObject {
             }
 
             if target == .coverModels {
-                let marker = Paths.coverSupport.appendingPathComponent("installed-v3")
-                if FileManager.default.fileExists(atPath: marker.path) {
-                    try FileManager.default.trashItem(at: marker, resultingItemURL: nil)
-                }
-                let styleMarker = Paths.coverSupport.appendingPathComponent("installed-v4")
-                if FileManager.default.fileExists(atPath: styleMarker.path) { try FileManager.default.trashItem(at: styleMarker, resultingItemURL: nil) }
-                let lyricsMarker = Paths.coverSupport.appendingPathComponent("installed-v5")
-                if FileManager.default.fileExists(atPath: lyricsMarker.path) { try FileManager.default.trashItem(at: lyricsMarker, resultingItemURL: nil) }
-                backend.coverReady = false; backend.coverStyleReady = false; backend.coverLyricsReady = false
+                backend.clearCoverComponentMarkers()
+                backend.refreshCoverInstallationState()
             }
 
             if target == .mainModels {
@@ -156,14 +158,16 @@ struct StorageSettingsView: View {
     @EnvironmentObject var backend: Backend
     @StateObject private var storage = StorageSettingsModel()
     @State private var pendingDelete: StorageTarget?
+    @State private var pendingComponent: CoverComponent?
 
     var body: some View {
         Form {
             Section("Audio analysis engine") {
                 Text(backend.coverRuntimeReady ? "Installed · ready for analysis" : "Engine installation required")
-                if backend.coverRuntimeReady && !backend.coverLyricsReady { Text("Update to Whisper large-v3-turbo for the new lyric transcriber. Additional model download required.").font(.caption) }
-                if backend.coverRuntimeReady && !backend.coverStyleReady { Text("Update the engine to download detailed style analysis.").font(.caption) }
-                Button(backend.coverRuntimeReady ? "Update / Repair Engine" : "Install Engine") {
+                Text("Every component below is optional except Melody and score. MLX is preferred automatically when installed and otherwise the CPU Transformers path is used.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Install recommended components") {
                     backend.installCoverRuntime { result in
                         if case .failure(let error) = result { storage.error = error.localizedDescription }
                         storage.refresh()
@@ -172,6 +176,11 @@ struct StorageSettingsView: View {
                 if backend.coverBusy {
                     ProgressView()
                     Text(backend.coverStatus).font(.caption)
+                }
+            }
+            Section("Analysis components") {
+                ForEach(CoverComponent.allCases) { component in
+                    componentRow(component)
                 }
             }
             Section("Downloaded models") {
@@ -205,8 +214,8 @@ struct StorageSettingsView: View {
         }
         .formStyle(.grouped)
         .padding(8)
-        .frame(width: 620, height: 520)
-        .onAppear { storage.refresh() }
+        .frame(width: 720, height: 760)
+        .onAppear { backend.refreshCoverInstallationState(); storage.refresh() }
         .alert(
             "Delete \(pendingDelete?.title ?? "data")?",
             isPresented: Binding(
@@ -223,6 +232,26 @@ struct StorageSettingsView: View {
             }
         } message: {
             Text(pendingDelete?.detail ?? "")
+        }
+        .alert(
+            "Remove \(pendingComponent?.title ?? "component")?",
+            isPresented: Binding(
+                get: { pendingComponent != nil },
+                set: { if !$0 { pendingComponent = nil } }
+            )
+        ) {
+            Button("Cancel", role: .cancel) { pendingComponent = nil }
+            Button("Move to Trash", role: .destructive) {
+                if let component = pendingComponent {
+                    backend.removeCoverComponent(component) { result in
+                        if case .failure(let error) = result { storage.error = error.localizedDescription }
+                        storage.refresh()
+                    }
+                }
+                pendingComponent = nil
+            }
+        } message: {
+            Text(pendingComponent?.detail ?? "The component files will be moved to the macOS Trash.")
         }
     }
 
@@ -253,5 +282,50 @@ struct StorageSettingsView: View {
     private func sizeText(_ bytes: Int64) -> String {
         guard bytes > 0 else { return "—" }
         return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    @ViewBuilder
+    private func componentRow(_ component: CoverComponent) -> some View {
+        let installed = backend.coverComponentReady(component)
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: installed ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(installed ? .green : .secondary)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(component.title)
+                    if component.required { Text("Required").font(.caption2).foregroundStyle(.secondary) }
+                    if component == .mlxWhisper { Text("Optional").font(.caption2).foregroundStyle(.secondary) }
+                }
+                    Text(component.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            if storage.scanning && storage.componentSizes[component] == nil {
+                ProgressView().controlSize(.small)
+            } else {
+                Text(sizeText(storage.componentSizes[component] ?? 0))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            if installed {
+                Button("Remove…") { pendingComponent = component }
+                    .buttonStyle(.bordered)
+                    .disabled(backend.busy || backend.coverBusy)
+            } else {
+                Button("Install") {
+                    storage.error = nil
+                    backend.installCoverComponent(component) { result in
+                        if case .failure(let error) = result { storage.error = error.localizedDescription }
+                        storage.refresh()
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(backend.busy || backend.coverBusy)
+            }
+        }
+        .padding(.vertical, 3)
     }
 }

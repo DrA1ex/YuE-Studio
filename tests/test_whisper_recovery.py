@@ -73,6 +73,7 @@ class WhisperRecoveryTests(unittest.TestCase):
             self.assertNotIn("inputs", call.kwargs)
         self.assertFalse(second.kwargs["return_token_timestamps"])
         self.assertFalse(second.kwargs["use_cache"])
+        self.assertNotIn("return_legacy_cache", second.kwargs)
         self.assertEqual(second.kwargs["num_beams"], 1)
         self.assertEqual(self.pipe.postprocess([output], return_timestamps="word")["text"].strip(), "Hello world")
 
