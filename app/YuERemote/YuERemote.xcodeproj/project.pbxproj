@@ -228,7 +228,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				COREML_CODEGEN_LANGUAGE = None;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "YuE Remote";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "YuE Studio on your Mac connects to this phone to use its Neural Engine.";
@@ -254,7 +254,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				COREML_CODEGEN_LANGUAGE = None;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "YuE Remote";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "YuE Studio on your Mac connects to this phone to use its Neural Engine.";

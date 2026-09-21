@@ -9,7 +9,8 @@ from ..ane.mil import MIL_VERSION, WEIGHT_SHAPES, arrays_from_state, build_progr
 from ..lean import nar_layer_state
 
 S_STEP, P_STEP = 512, 1024
-QBLK, KCHUNK = 512, 1024                          # what the iPhone's compiler accepts (see docs/apple-silicon.md)
+QBLK, KCHUNK = 128, 1024                          # small query tiles bound full-key softmax memory
+REMOTE_PROGRAM_VERSION = "coreml2"                # invalidate only phone programs, not weights or Mac ANE caches
 ROW_BLOCK, HEAD_NORM = None, "matmul"             # the plain layer form: proven up to 4096 rows on an iPhone 17 Pro
 LAYERS = 2                                        # layers per program call
 MAX_ROWS = 4096                                   # longer songs stay on the Mac until the 6656 program compiles there
@@ -22,7 +23,7 @@ def bucket(n, step):
 
 def program_name(S, P):
     form = f"rb{ROW_BLOCK}" if ROW_BLOCK else "hr" if HEAD_NORM == "reduce" else "plain"
-    return f"layers{LAYERS}_{S}_{P}_{form}_q{QBLK}_k{KCHUNK}_{MIL_VERSION}"
+    return f"layers{LAYERS}_{S}_{P}_{form}_q{QBLK}_k{KCHUNK}_{MIL_VERSION}_{REMOTE_PROGRAM_VERSION}"
 
 
 def weight_identity(model):
@@ -82,7 +83,8 @@ class RemoteClient:
             CACHE.mkdir(parents=True, exist_ok=True)
             build_program([None] * LAYERS, None, S=S, P=P, D=cfg.hidden_size, H=cfg.num_attention_heads, KV=cfg.num_key_value_heads,
                           HD=cfg.head_dim, F=cfg.intermediate_size, eps=cfg.rms_norm_eps, qblk=QBLK, kchunk=KCHUNK,
-                          weights_as_inputs=True, target="iOS18", row_block=ROW_BLOCK, head_norm=HEAD_NORM, package_path=pkg)
+                          weights_as_inputs=True, target="iOS18", row_block=ROW_BLOCK, head_norm=HEAD_NORM,
+                          attention_mode="softmax", package_path=pkg)
         files, blobs = [], []
         for path in sorted(p for p in pkg.rglob("*") if p.is_file()):
             data = path.read_bytes()

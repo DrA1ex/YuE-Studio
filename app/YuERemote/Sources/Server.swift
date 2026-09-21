@@ -96,7 +96,15 @@ final class Server: ObservableObject {
             var h: [String: Any] = ["op": op, "ok": true]; extra.forEach { h[$0] = $1 }
             return Frame(header: h, payload: payload)
         }
-        func fail(_ message: String) -> Frame { say("\(op): \(message)"); return Frame(header: ["op": op, "ok": false, "error": message], payload: Data()) }
+        func fail(_ message: String) -> Frame {
+            if op == "open" || op == "program" {
+                engine.closeSession()
+                session = "unavailable: " + message
+                passLine = ""; running = false; tflops = 0
+            }
+            say("\(op): \(message)")
+            return Frame(header: ["op": op, "ok": false, "error": message], payload: Data())
+        }
         do {
             switch op {
             case "hello":

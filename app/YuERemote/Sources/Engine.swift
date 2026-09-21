@@ -152,15 +152,22 @@ final class Engine {
         defer { ticker.cancel() }
         let plan = try await MLComputePlan.load(contentsOf: url, configuration: config)
         var off = 0, total = 0
+        var rejected: [String] = []
         if case .program(let prog) = plan.modelStructure, let main = prog.functions["main"] {
             for op in main.block.operations {
                 if let device = plan.deviceUsage(for: op)?.preferred {
                     total += 1
-                    if case .neuralEngine = device {} else { off += 1 }
+                    if case .neuralEngine = device {} else {
+                        off += 1
+                        if rejected.count < 5 { rejected.append(op.operatorName) }
+                    }
                 }
             }
         }
-        guard off == 0, total > 0 else { throw EngineError.message("program \(program): \(off) of \(total) ops would not run on the Neural Engine") }
+        guard off == 0, total > 0 else {
+            log("Neural Engine placement rejected; examples: " + rejected.joined(separator: ", "))
+            throw EngineError.message("program \(program): \(off) of \(total) ops would not run on the Neural Engine; update YuE Studio on the Mac to regenerate compatible programs")
+        }
         let model = try MLModel(contentsOf: url, configuration: config)
         log(String(format: "program %@ ready in %.0f s (%d ops on the Neural Engine)", program, Date().timeIntervalSince(t0), total))
         var s = Session(S: S, P: P, sReal: sReal, pReal: pReal, program: program, perCall: perCall, model: model, kv: Array(repeating: nil, count: Self.layers))

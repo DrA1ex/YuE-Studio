@@ -317,7 +317,7 @@ MIL program `src/yue2/ane/mil.py` generates for the Mac's private route is saved
 iOS 18 `.mlpackage` with weights as inputs, so it has no constants (about 300 KB) and one program
 serves all 28 layers.
 
-Measured on an iPhone 17 Pro (A19 Pro, 12 GB), all ops on its Neural Engine:
+Historical upstream measurements on an iPhone 17 Pro (A19 Pro, 12 GB), before the OS 27 compatibility change below; these are not measurements of this build:
 
 | bucket (rows × prefix) | per 2-layer call | 28-layer pass |
 |---|---|---|
@@ -326,8 +326,7 @@ Measured on an iPhone 17 Pro (A19 Pro, 12 GB), all ops on its Neural Engine:
 | 2048 × 4096 | 256 ms | 3.6 s |
 | 4096 × 4096 | 498 ms | 7.0 s |
 
-That is at least the M4's pace for the same program. What its compiler accepts differs from
-the Mac's (`src/yue2/remote/client.py` bakes the working choices in): query tiles of 512 rows
+The original compiler accepted a different layout from the Mac: query tiles of 512 rows
 with 1024-key chunks (1024-row tiles fail outright from 4096 rows), and the plain layer form.
 Row-blocking the projections and MLP does not help (the whole program is refused at 6656
 rows), and the reduce form of the per-head RMSNorm is refused at any length. At 6656 rows
@@ -346,6 +345,25 @@ correlate 0.999989 with the Mac's Neural Engine (0.46% RMS), the weight transfer
 34 MB/s over Wi-Fi (85 s, once), and with two draft songs queued the scheduler put one on
 each Neural Engine and finished both in 99 s instead of about 130 s.
 
+**OS 27 compatibility.** The original online attention recurrence can cause public Core ML
+to reject the complete program and place all work on CPU (338/338 and 513/513 operations in
+the reported 1024×2048 and 1536×2048 programs). The remote generator now normalizes over all
+keys in each 128-row query tile, retaining the scaled exponential numerator and dividing
+after the value matmul to limit fp16 underflow. This is the same full-attention calculation,
+with a different reduction order. The score tensor at 4096×4096 is bounded to 32 MiB per tile.
+The Mac's private ANE graph and the stored YuE weights are unchanged.
+
+Remote program names include `coreml2`; old Mac and iPhone program caches cannot accidentally
+select the rejected graphs. Compatible packages are generated/sent as needed and compiled on
+the phone, without resending cached model weights. YuE Remote still requires all placed ops
+to use ANE: the fix does not silently run synthesis on the phone's CPU. Failed program loads
+now clear the loading state and show the error in the session status.
+
+Synthetic validation is available via `tools/ane/validate_remote_program.py`. It checks actual
+Core ML placement on the host, compares new CPU/ANE outputs with the old CPU graph and an
+independent float32 implementation, and uses random weights plus masked prefix/song padding.
+Host placement and kernel accuracy do not establish iPhone placement or end-to-end speed.
+
 Protocol (`src/yue2/remote/protocol.py`, `app/YuERemote/Sources/Protocol.swift`): TCP frames of
 `u32 header length | JSON header | u64 payload length | payload`. Ops: `hello`, `weights_begin`
 / `weights_layer` / `weights_end` (2.8 GB, once), `program` (the mlpackage files, compiled on the
@@ -356,9 +374,13 @@ unpadded), `tables` (rotary tables and key bias), `velocity` (x in, h out, fp16 
 
 The Mac app finds the phone with Bonjour (`_yuestudio._tcp`) and hands the worker its address
 (`{"cmd": "remote", "host", "port", "name"}`); the worker treats it as a third engine
-(`Scheduler.remote_synth`): after the internal Neural Engine has taken the top song that wants
-it, the phone takes the next song the user allowed a Neural Engine for, waiting or already on
-the GPU (which then hands over mid-trajectory, `nar_switch` with `may_switch()` returning
-`"remote"`). A song the phone cannot run (its compiler rejects the length, or the connection
-drops) goes back to the queue for the Mac. `engine="remote"` in `yue2.nar.synthesize` and
+(`Scheduler.remote_synth`). Within a queue wave, songs alternate Mac/iPhone, starting with
+Mac: one song stays local, two split 1/1, three split 2/1. The assignment remains fixed as
+songs finish; a new wave starts when the queue drains. Only songs admitted while the phone
+is connected and allowed by the user's engine setting can use it. Remote synthesis overlaps
+Mac token generation, synthesis or rendering even when local pipelining is disabled. The
+Mac still performs the remote song's prefill, solver bookkeeping and final audio decode.
+There is no mid-solve migration from Mac to phone. Unsupported lengths, rejected programs
+and connection failures return that song to the Mac without another phone attempt.
+`engine="remote"` in `yue2.nar.synthesize` and
 `RemoteVelocity` in `src/yue2/remote/velocity.py` mirror the `ANEVelocity` contract.

@@ -83,7 +83,7 @@ def weight_input_shapes(D=2048, H=16, KV=8, HD=128, F=6144):
 
 
 def build_program(Ws, out_dir, *, S, P, D=2048, H=16, KV=8, HD=128, F=6144, eps=1e-6, qblk=1024, kchunk=2048, weights_as_inputs=False,
-                  target="macOS15", package_path=None, row_block=None, head_norm="matmul"):
+                  target="macOS15", package_path=None, row_block=None, head_norm="matmul", attention_mode="online"):
     """Write model.mil + weights/weight.bin + meta.json for a stack of layers at bucket (S, P).
 
     Inputs: x, cos, sin, bias, and pk{i}/pv{i} for each layer i in the stack. Fewer, larger
@@ -103,7 +103,11 @@ def build_program(Ws, out_dir, *, S, P, D=2048, H=16, KV=8, HD=128, F=6144, eps=
     matmul with a block-diagonal [n*HD, n*HD] constant that yields each head's sum already spread
     across its columns, and a tiny matmul in place of the tile op: only ops the iPhone's compiler
     accepted at 6656 rows in the plain layer form).
+    ``attention_mode="softmax"`` uses a single key-axis softmax per query tile for public
+    Core ML. The default online recurrence remains unchanged for the Mac's private ANE path.
     """
+    if attention_mode not in {"online", "softmax"}:
+        raise ValueError("attention_mode must be online or softmax")
     import coremltools as ct
     from coremltools.converters.mil import Builder as mb
     from coremltools.converters.mil.mil import types
@@ -171,6 +175,16 @@ def build_program(Ws, out_dir, *, S, P, D=2048, H=16, KV=8, HD=128, F=6144, eps=
                                  mb.add(x=mb.mul(x=x2, y=cos4), y=mb.mul(x=x1, y=sin4))], axis=-1)
 
     def attend(qb, kk, vv, bias):       # qb [G,KV,R,HD]; kk/vv [1,KV,K,HD] (broadcast over G); bias [1,1,1,K]
+        if attention_mode == "softmax":
+            # Core ML on OS 27 rejects the online max/sum recurrence as a whole.
+            # Normalize over all keys, keeping memory bounded with small query tiles.
+            scores = mb.add(x=mb.matmul(x=qb, y=kk, transpose_y=True), y=bias)
+            maximum = mb.reduce_max(x=scores, axes=[-1], keep_dims=True)
+            numerator = mb.exp(x=mb.sub(x=scores, y=mb.add(x=maximum, y=np.float16(ACC_SHIFT))))
+            # Divide after P@V: normalized fp16 probabilities underflow on ANE for
+            # long prefixes. This keeps the same scaling as the online formulation.
+            denominator = mb.reduce_sum(x=numerator, axes=[-1], keep_dims=True)
+            return mb.real_div(x=mb.matmul(x=numerator, y=vv), y=denominator)
         m = l = acc = None
         for c in range(0, K, kchunk):
             e = min(c + kchunk, K)
@@ -302,7 +316,7 @@ def build_program(Ws, out_dir, *, S, P, D=2048, H=16, KV=8, HD=128, F=6144, eps=
                            minimum_deployment_target=getattr(ct.target, target),
                            outputs=[ct.TensorType(name="h", dtype=np.float16)], skip_model_load=True)
     meta = {"S": S, "P": P, "K": K, "D": D, "H": H, "KV": KV, "HD": HD, "qblk": qblk, "kchunk": kchunk, "layers": n,
-            "weights_as_inputs": weights_as_inputs, "target": target, "row_block": row_block, "head_norm": head_norm,
+            "weights_as_inputs": weights_as_inputs, "target": target, "row_block": row_block, "head_norm": head_norm, "attention_mode": attention_mode,
             "inputs": ["x", "cos", "sin", "bias"] + kv_names + wnames + spread_names}
     if package_path is not None:
         package_path = Path(package_path)

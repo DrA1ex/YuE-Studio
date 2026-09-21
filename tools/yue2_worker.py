@@ -12,6 +12,8 @@ the whole policy; in short:
   GPU, synthesis  drafts, and full-quality songs while the Neural Engine is busy. A queued song
                   that outranks the song synthesizing on the GPU starts its batch and the
                   synthesis pauses between steps until the GPU is free again.
+  iPhone          every second admitted song, with stable ownership and Mac fallback.
+                  Its synthesis overlaps Mac work even without local pipelining.
   Rendering       always admitted: its tiles interleave with token steps.
 
 Requests: {"cmd": "generate", "style", "lyrics", "cot": "full|melody|off", "seed", "random_seed", "batch",
@@ -178,7 +180,7 @@ REMOTE_MAX_ROWS = int(os.environ.get("YUE2_REMOTE_MAX_ROWS", 4096))   # largest 
 
 def remote_can_take(song):
     from yue2.remote.client import S_STEP, bucket
-    return REMOTE is not None and song.allow_ane and not song.remote_failed and bucket(song.frames + 2, S_STEP) <= REMOTE_MAX_ROWS
+    return REMOTE is not None and song.remote_assigned and song.allow_ane and not song.remote_failed and bucket(song.frames + 2, S_STEP) <= REMOTE_MAX_ROWS
 
 
 def set_remote(req):
@@ -297,6 +299,7 @@ class Song:
         self.program_failed = False
         self.migrate = None                       # "ane" / "remote": granted that engine mid-solve
         self.migrated = False
+        self.remote_assigned = False              # stable whole-song allocation within a queue wave
         self.remote_failed = False                # the iPhone could not run this song's length
 
     @property
@@ -334,11 +337,18 @@ class Scheduler:
         self.ane_synth = None                     # song on the Neural Engine (or granted it)
         self.remote_synth = None                  # song on the iPhone (or granted it)
         self.render = None                        # song rendering on the GPU
+        self.remote_prefill = False
+        self.admitted = 0                         # resets only when the queue drains
         self.ane_prefill = False                  # the Neural Engine song is briefly on the GPU (prefill)
 
     # -- bookkeeping ---------------------------------------------------------
     def submit(self, songs):
         with self.cv:
+            if not self.songs:
+                self.admitted = 0
+            for song in songs:
+                self.admitted += 1
+                song.remote_assigned = REMOTE is not None and song.allow_ane and self.admitted % 2 == 0
             self.songs.extend(songs)
         for s in songs:
             s.set_state(s.state, "waiting for the GPU" if s.state == QUEUED else "waiting")
@@ -405,14 +415,17 @@ class Scheduler:
         live = sorted(self.songs, key=lambda s: s.priority)
         def first(state, ok=lambda s: True):
             return next((s for s in live if s.state == state and not s.cancel.is_set() and ok(s)), None)
-        running = any(x is not None for x in (self.token_batch, self.gpu_synth, self.ane_synth, self.remote_synth, self.render))
+        running = any(x is not None for x in (self.token_batch, self.gpu_synth, self.ane_synth, self.render))
         starts = []
+        for song in live:
+            if song.state == SYNTH_WAIT and song.remote_assigned and not remote_can_take(song):
+                song.remote_assigned = False  # fallback stays on the Mac, including after reconnect
 
         # Neural Engine: the highest-priority song that wants it, whether waiting or already on the GPU.
         if self.ane_synth is None and (CONCURRENT or not running):
-            waiting = first(SYNTH_WAIT, lambda s: s.wants_ane)
+            waiting = first(SYNTH_WAIT, lambda s: s.wants_ane and not remote_can_take(s))
             g = self.gpu_synth
-            movable = g if (g is not None and g.wants_ane and g.program_ready.is_set() and not g.migrate and not g.cancel.is_set()) else None
+            movable = g if (g is not None and g.wants_ane and not remote_can_take(g) and g.program_ready.is_set() and not g.migrate and not g.cancel.is_set()) else None
             best = min((s for s in (waiting, movable) if s is not None), key=lambda s: s.priority, default=None)
             if best is not None and best is movable:
                 best.migrate = "ane"; self.ane_synth = best         # picked up at its next step boundary
@@ -421,18 +434,13 @@ class Scheduler:
                 starts.append((run_ane, best))
                 running = True
 
-        # iPhone: the next song allowed a Neural Engine that the phone can hold, waiting or on the GPU.
-        if REMOTE is not None and self.remote_synth is None and (CONCURRENT or not running):
-            waiting = first(SYNTH_WAIT, lambda s: remote_can_take(s) and s is not self.ane_synth)
-            g = self.gpu_synth
-            movable = g if (g is not None and remote_can_take(g) and not g.migrate and not g.cancel.is_set() and g is not self.ane_synth) else None
-            best = min((s for s in (waiting, movable) if s is not None), key=lambda s: s.priority, default=None)
-            if best is not None and best is movable:
-                best.migrate = "remote"; self.remote_synth = best
-            elif best is not None:
+        # Reserve the phone's songs; never migrate a Mac song to fill an idle phone.
+        # Remote work can overlap local work even when local pipelining is disabled.
+        if REMOTE is not None and self.remote_synth is None:
+            best = first(SYNTH_WAIT, remote_can_take)
+            if best is not None:
                 self.remote_synth = best; best.state = SYNTHING
                 starts.append((run_remote, best))
-                running = True
 
         # Rendering: always admitted (tiles interleave with token steps; a GPU synthesis pauses for it).
         if self.render is None and (CONCURRENT or not running):
@@ -444,7 +452,7 @@ class Scheduler:
 
         # GPU: the highest-priority song that needs it decides between tokenizing and synthesis.
         q = first(QUEUED)
-        cand = first(SYNTH_WAIT, lambda s: not s.wants_ane or self.ane_synth is not None) if self.gpu_synth is None else None
+        cand = first(SYNTH_WAIT, lambda s: not remote_can_take(s) and (not s.wants_ane or self.ane_synth is not None)) if self.gpu_synth is None else None
         if q is not None and cand is not None and cand.priority < q.priority:
             q = None                                            # the synthesis candidate outranks the queue
         # Tokenizing: the top queued song and every queued song of the same kind with it. It also
@@ -468,7 +476,7 @@ class Scheduler:
     def gpu_wanted_elsewhere(self):
         """A GPU synthesis pauses while this is true (tokenizing, rendering, or the Neural Engine
         song's prefill are on the GPU: MLX's long kernels would starve them)."""
-        return self.token_batch is not None or self.render is not None or self.ane_prefill
+        return self.token_batch is not None or self.render is not None or self.ane_prefill or self.remote_prefill
 
     def summary(self):
         with self.cv:
@@ -596,7 +604,7 @@ def run_batch(batch):
                 SCHED.finish(s, CANCELLED, "stopped"); return
             log(f"Song tokens for {s.label}: {len(tokens)} ({t['seconds']:.0f} s)" + (", truncated" if truncated else "")
                 + ("; Neural Engine" if s.wants_ane else "; GPU"))
-            s.set_state(SYNTH_WAIT, "waiting", engine="ane" if s.wants_ane else "mlx")
+            s.set_state(SYNTH_WAIT, "waiting", engine="remote" if remote_can_take(s) else "ane" if s.wants_ane else "mlx")
             SCHED.tick()                                   # synthesis can start while the batch continues
         def on_row_done(i, tokens, t):
             if i not in released:
@@ -747,7 +755,7 @@ def run_remote(song):
         with SCHED.cv:
             if SCHED.remote_synth is song:
                 SCHED.remote_synth = None
-            SCHED.ane_prefill = False
+            SCHED.remote_prefill = False
     try:
         pipe, model = acquire_model()
         kwargs, audio_s, _ = synth_common(song, model, pipe)
@@ -757,7 +765,7 @@ def run_remote(song):
         def on_phase(text):
             song.progress(0.0, text)
             with SCHED.cv:
-                SCHED.ane_prefill = text.startswith("prefilling")
+                SCHED.remote_prefill = text.startswith("prefilling")
             SCHED.tick()
         kwargs["on_phase"] = on_phase
         song.used_engine = "remote"
@@ -768,6 +776,7 @@ def run_remote(song):
             latents = synthesize(model, song.plan.prefix, song.codec, song.seed, engine="remote", remote=client,
                                  offload_ar=pipe.offload_ar, **kwargs)
         except (RemoteError, OSError) as exc:
+            song.remote_failed = True
             reason = str(exc).splitlines()[0][:120]
             if isinstance(exc, OSError) or "closed the connection" in reason:
                 clear_remote(reason)
