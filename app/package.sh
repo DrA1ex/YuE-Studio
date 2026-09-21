@@ -11,7 +11,7 @@ APP="$DIST/YuE Studio.app"
 ICON_NAME="YuE_icon"
 ICON_DOC="$ROOT/icons/$ICON_NAME.icon"
 UV="${UV:-$(command -v uv)}"
-VERSION="$(date +%Y%m%d)-$(cat "$APPDIR"/Sources/YuEStudio/*.swift "$APPDIR"/Package.swift "$ROOT"/src/yue2/*.py "$ROOT"/src/yue2/ane/*.py "$ROOT"/tools/*.py "$ROOT"/tools/sheetsage-requirements.txt "$ROOT"/tools/whisper-requirements.txt "$ROOT"/skills/yue2-music/scripts/abc_tools.py "$ROOT"/pyproject.toml "$ICON_DOC/icon.json" "$ICON_DOC/Assets/yueSVG.png" | shasum | cut -c1-8)"
+VERSION="$(date +%Y%m%d)-$(cat "$APPDIR"/Sources/YuEStudio/*.swift "$APPDIR"/Package.swift "$ROOT"/src/yue2/*.py "$ROOT"/src/yue2/ane/*.py "$ROOT"/src/yue2/remote/*.py "$ROOT"/tools/*.py "$ROOT"/tools/sheetsage-requirements.txt "$ROOT"/tools/whisper-requirements.txt "$ROOT"/skills/yue2-music/scripts/abc_tools.py "$ROOT"/pyproject.toml "$ICON_DOC/icon.json" "$ICON_DOC/Assets/yueSVG.png" | shasum | cut -c1-8)"
 
 [ -d "$ICON_DOC" ] || { echo "Missing Icon Composer document: $ICON_DOC" >&2; exit 1; }
 
@@ -34,9 +34,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key><string>$ICON_NAME</string>
   <key>CFBundleIconName</key><string>$ICON_NAME</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
-  <key>CFBundleShortVersionString</key><string>0.2</string>
+  <key>CFBundleShortVersionString</key><string>0.4.0</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSArchitecturePriority</key><array><string>arm64</string></array>
+  <key>NSLocalNetworkUsageDescription</key><string>Use an iPhone running YuE Remote to synthesize songs on its Neural Engine.</string>
+  <key>NSBonjourServices</key><array><string>_yuestudio._tcp</string></array>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSHumanReadableCopyright</key><string>YuE2 model: m-a-p (Apache-2.0 code, model licence applies)</string>
 </dict></plist>
@@ -66,7 +68,7 @@ rsync -a --exclude '__pycache__' --exclude '*.pyc' \
   "$ROOT/pyproject.toml" "$ROOT/README.md" "$ROOT/LICENSE" "$ROOT/MODEL_LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$ROOT/MANIFEST.in" "$ROOT/licenses" \
   "$ROOT/src" "$ROOT/examples" "$APP/Contents/Resources/payload/yue2-src/"
 mkdir -p "$APP/Contents/Resources/payload/yue2-src/tools"
-cp "$ROOT/tools/yue2_worker.py" "$ROOT/tools/download_models.py" "$ROOT/tools/transcribe_cover.py" "$ROOT/tools/cover_score.py" "$ROOT/tools/audio_analysis.py" "$ROOT/tools/analysis_cache.py" "$ROOT/tools/lyrics_structure.py" "$ROOT/tools/whisper_transcriber.py" "$ROOT/tools/voice_activity.py" "$ROOT/tools/structure_analysis.py" "$ROOT/tools/mlx_whisper_worker.py" "$ROOT/tools/sheetsage-requirements.txt" "$ROOT/tools/whisper-requirements.txt" "$APP/Contents/Resources/payload/yue2-src/tools/"
+cp "$ROOT/tools/transcribe_sheetsage.py" "$ROOT/tools/yue2_worker.py" "$ROOT/tools/download_models.py" "$ROOT/tools/transcribe_cover.py" "$ROOT/tools/cover_score.py" "$ROOT/tools/audio_analysis.py" "$ROOT/tools/analysis_cache.py" "$ROOT/tools/lyrics_structure.py" "$ROOT/tools/whisper_transcriber.py" "$ROOT/tools/voice_activity.py" "$ROOT/tools/structure_analysis.py" "$ROOT/tools/mlx_whisper_worker.py" "$ROOT/tools/sheetsage-requirements.txt" "$ROOT/tools/whisper-requirements.txt" "$APP/Contents/Resources/payload/yue2-src/tools/"
 mkdir -p "$APP/Contents/Resources/payload/yue2-src/skills/yue2-music/scripts"
 cp "$ROOT/skills/yue2-music/scripts/abc_tools.py" "$APP/Contents/Resources/payload/yue2-src/skills/yue2-music/scripts/"
 

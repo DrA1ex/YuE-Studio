@@ -1,0 +1,34 @@
+name: YuERemote
+options:
+  bundleIdPrefix: com.halftone
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+targets:
+  YuERemote:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    info:
+      path: Info.plist
+      properties:
+        NSBonjourServices: [_yuestudio._tcp]
+        NSLocalNetworkUsageDescription: YuE Studio on your Mac connects to this phone to use its Neural Engine.
+        UILaunchScreen: {}
+        CFBundleDisplayName: YuE Remote
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.halftone.YuERemote
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: YuERemote.entitlements
+        COREML_CODEGEN_LANGUAGE: None
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_CFBundleDisplayName: YuE Remote
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: YuE Studio on your Mac connects to this phone to use its Neural Engine.
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        SWIFT_VERSION: "5.0"
+        MARKETING_VERSION: "0.4.0"
+        CURRENT_PROJECT_VERSION: "1"

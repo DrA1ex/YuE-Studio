@@ -9,6 +9,10 @@ weights and its licence are theirs, and the app downloads the weights from Huggi
 launch. What this repository adds is the app, the pipeline that keeps the GPU and the Neural
 Engine busy at the same time, and the engines that make the model run well on Apple Silicon.
 
+**Fork development base: 0.4.0.** Upstream features, retained customizations,
+synthetic test results and remaining device checks are recorded in
+[the integration report](docs/upstream-0.4-integration.md).
+
 ## The app
 
 - **Queue songs and watch them move** through Planning, Tokenizing, Synthing and Rendering, with
@@ -328,3 +332,11 @@ The YuE2 technical report is coming soon. For now, please cite **[MERT](https://
 ## Contact
 
 For collaborations, licensing, and data partnerships, please contact [gezhang@umich.edu](mailto:gezhang@umich.edu).
+
+## iPhone as a second Neural Engine
+
+`app/YuERemote` is a companion iOS app: with it running on an iPhone on the same network, YuE
+Studio uses the phone's Neural Engine as a second synthesis engine, so two queued songs
+synthesize at once (one on the Mac, one on the phone). It needs an Apple developer account to
+install (open `app/YuERemote/YuERemote.xcodeproj` in Xcode, set your team, run on the phone).
+The 2.8 GB of synthesis weights are sent to the phone once. See `docs/apple-silicon.md`.

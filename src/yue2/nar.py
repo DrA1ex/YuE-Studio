@@ -262,7 +262,7 @@ def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
                cancelled=None, query_chunk_size=None,
                on_progress: Callable[[int, int], None] | None = None, engine="auto",
                on_prepare: Callable[[int, int], None] | None = None, lock=None,
-               on_phase: Callable[[str], None] | None = None):
+               on_phase: Callable[[str], None] | None = None, remote=None):
     """Return CPU FP32 [frames,64] latents, solving original chunks serially.
 
     ``lock`` (a context manager) is held whenever this call runs PyTorch work on
@@ -280,8 +280,10 @@ def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
     if model.training:
         raise ValueError("synthesize requires model.eval()")
     import os
-    if engine not in {"auto", "torch", "mlx", "ane"}:
-        raise ValueError("engine must be auto, torch, mlx, or ane")
+    if engine not in {"auto", "torch", "mlx", "ane", "remote"}:
+        raise ValueError("engine must be auto, torch, mlx, ane, or remote")
+    if engine == "remote" and remote is None:
+        raise ValueError("engine='remote' needs a yue2.remote.client.RemoteClient")
     if engine == "auto":
         engine = os.environ.get("YUE2_NAR_ENGINE", "auto")
     if engine == "auto":
@@ -293,7 +295,7 @@ def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
             engine = "mlx"
         else:
             engine = "torch"
-    use_mlx, use_ane = engine == "mlx", engine == "ane"
+    use_mlx, use_ane, use_remote = engine == "mlx", engine == "ane", engine == "remote"
     from .lean import is_lean
     lock = nullcontext() if lock is None else lock
     phase = on_phase if on_phase is not None else (lambda text: None)
@@ -312,6 +314,11 @@ def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
         else:
             with lock:
                 ane_runtime.weights_for(model)
+    if use_remote:
+        from .remote.velocity import RemoteVelocity
+        phase("checking the iPhone")
+        if remote.ensure_weights(model, on_progress=phase):
+            phase("weights stored on the iPhone")
     chunks = song_chunks(prefix, codec, seed, context)
     output = []
     for chunk_index, chunk in enumerate(chunks):
@@ -342,6 +349,14 @@ def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
                 elif use_ane:
                     with lock:
                         solver = ane_runtime.ANEVelocity(engine, model, on_prepare=on_prepare)
+                    try:
+                        output.append(solver.solve(chunk.noise, steps, cancelled, on_progress=progress))
+                    finally:
+                        solver.close()
+                elif use_remote:
+                    with lock:
+                        solver = RemoteVelocity(engine, model, remote, on_phase=phase)
+                    phase("solver step 1 running on the iPhone")
                     try:
                         output.append(solver.solve(chunk.noise, steps, cancelled, on_progress=progress))
                     finally:

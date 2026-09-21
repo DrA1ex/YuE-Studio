@@ -147,14 +147,33 @@ Four changes:
 A retained temp directory does not make a later ANE compile faster
 (28.8 s vs 26.8 s for the largest program); the per-process compile remains.
 
-## Draft quality and full renders
+## Titles, playback and the form
+
+A run can be given a **Title**: it names the run folder (`<timestamp>-<title
+slug>`), is stored in each song's `tokens.json` and `result.json`, and heads
+the run's section and rows in the app. Left empty, it is chosen from the
+lyrics by the on-device language model (Apple's Foundation Models framework,
+macOS 26 with Apple Intelligence; weak-linked, so on macOS 14 and 15 the first
+lyric line is used instead) when Generate is pressed; a title the model chose
+is replaced on the next run unless you edit it. Beside the Lyrics label,
+**Write lyrics** (shown only when that model is available) writes lyrics for
+the style and title with guided generation (one described field per section,
+temperature 0.9: free-form prompting made the small model repeat itself) after a
+sheet asks what the song is about; a spinner covers the lyrics box meanwhile. It
+refuses with an alert while songs are queued or generating, since the model
+shares the chip with the engines, and asks before replacing lyrics you typed. The transport bar under the song list
+plays the loaded song with pause, back to start, 10-second skips and a
+scrubbing slider (space toggles play). The Style editor has a grab bar to make
+it taller; the height persists.
+
+## Quality and engines
 
 Synthesis is the expensive stage for long songs, and most of its cost is
-independent of whether the song is any good. The app therefore defaults to
-**Draft** quality: the score and tokens are generated exactly as before (they
-define the song), and synthesis runs 8 midpoint steps on MLX instead of 32. No
-Neural Engine compile is involved. Measured on a 20 s song against the 32-step
-reference (`tools/bench_draft.py`):
+independent of whether the song is any good. The app's Quality menu therefore
+offers four modes: **Draft (GPU)**, **Draft (GPU + Neural Engine)**, **Full
+(GPU)** and **Full (GPU + Neural Engine)**. Draft runs 8 midpoint steps
+instead of 32 with the same score, tokens, seed and noise. Measured on a 20 s
+song against the 32-step reference (`tools/bench_draft.py`):
 
 | steps | time | latent corr | rel. RMS error |
 | --- | --- | --- | --- |
@@ -163,18 +182,20 @@ reference (`tools/bench_draft.py`):
 | 12 | 28 s | 0.9998 | 0.018 |
 | 8 | 18 s | 0.9996 | 0.030 |
 
-Each draft row has **Render full quality**, which re-synthesizes from the saved
-tokens with the same seed and noise at 32 steps (worker command `render`),
-keeps the preview as `draft.flac`, and replaces `audio.flac`. `result.json`
-records `quality`, `ode_steps` and `nar_engine`.
+The engine part (`engines: gpu|gpu+ane` in the worker request) says whether the
+scheduler may give the song to the Neural Engine. With "GPU" only, the Neural
+Engine's 2.8 GB of weight surfaces are never mapped, the lowest-memory setting
+and the right one on 16 GB Macs. Drafts on the Neural Engine were pointless
+while a bucket's compile took minutes; with one shared program per bucket it is
+seconds to a minute, so they are offered. The Neural Engine is used only for
+lengths its compiler accepts (up to 12288 NAR rows with MIL v7); longer songs
+stay on the GPU whatever the mode.
 
-Engine choice per song (`choose_engine` in the worker): drafts use MLX; "auto"
-uses the Neural Engine only when the bucket has at most 8192 NAR rows (about
-5.4 minutes of audio), because its compiler rejects larger programs (seen at
-8704 x 12288 and 9216 x 14336); longer songs use MLX. Compile time grows roughly
-with S x (S + P): under a minute for a 20 s song, 6 minutes for 4 minutes of
-audio, about 30 minutes for 5 minutes, and the ANE solve is only ~1.3x faster
-than MLX at that length, so a single long song is faster on MLX end to end.
+Each draft row has **Render full quality**, which re-synthesizes from the saved
+tokens with the same seed and noise at 32 steps (worker command `render`) with
+the engine choice current in the menu, keeps the preview as `draft.flac`, and
+replaces `audio.flac`. `result.json` records `quality`, `ode_steps` and
+`nar_engine`.
 
 ## One program per bucket (weights as inputs)
 
@@ -266,6 +287,17 @@ song finishes. Tokens are written to the song folder as soon as they exist, so
 a song whose synthesis never ran can be synthesized later with the `render`
 command (the app lists such songs as "tokens only").
 
+**Background compiles must not load.** The bridge's original load function
+compiled a program and loaded it into the engine (mapping its arena in the
+process's ~3.5 GiB address window) before `precompile` unloaded it again. With
+a long song's program resident next to the 2.8 GB of weight surfaces, that
+transient second mapping overflowed the window and the *running* inference
+failed ("Program Inference error", status 0x2) within seconds of "programs
+ready". `ane_program_compile(dir, do_load=0)` now compiles without loading;
+programs are loaded only by `ensure`, after the previous bucket is unloaded. A
+pass that still fails with an inference error is retried once after reloading
+the program (the solver state is on the CPU, so nothing is lost).
+
 **Memory between jobs.** When the queue drains the worker releases its
 working memory (MLX weights and cache, ANE weight surfaces and program
 mappings, the VAE, the MPS cache): about 11 GB -> 5 GB resident with the lean
@@ -273,3 +305,60 @@ model kept. After `YUE2_IDLE_UNLOAD_S` (default 600 s) idle it drops the model
 too (-> 0.6 GB); the next job reloads it in about a second. Compiled ANE
 programs survive the first level (they hold no weights now) and are freed by
 the second.
+
+## iPhone companion (YuE Remote)
+
+`app/YuERemote` is an iOS app (Xcode project generated by `xcodegen generate`, signed with an
+Apple Development identity) that turns an iPhone into a second Neural Engine for synthesis.
+The Mac keeps the solver loop and the tiny CPU-side maths (input projection, time embedding,
+final norm, output projection); the phone runs the 28 decoder layers of each pass, two per
+Core ML call, through the **public** Core ML API (`MLModel`, `.cpuAndNeuralEngine`). The same
+MIL program `src/yue2/ane/mil.py` generates for the Mac's private route is saved as an
+iOS 18 `.mlpackage` with weights as inputs, so it has no constants (about 300 KB) and one program
+serves all 28 layers.
+
+Measured on an iPhone 17 Pro (A19 Pro, 12 GB), all ops on its Neural Engine:
+
+| bucket (rows × prefix) | per 2-layer call | 28-layer pass |
+|---|---|---|
+| 512 × 1024 | 44 ms | 0.62 s |
+| 2048 × 2048 | 215 ms | 3.0 s |
+| 2048 × 4096 | 256 ms | 3.6 s |
+| 4096 × 4096 | 498 ms | 7.0 s |
+
+That is at least the M4's pace for the same program. What its compiler accepts differs from
+the Mac's (`src/yue2/remote/client.py` bakes the working choices in): query tiles of 512 rows
+with 1024-key chunks (1024-row tiles fail outright from 4096 rows), and the plain layer form.
+Row-blocking the projections and MLP does not help (the whole program is refused at 6656
+rows), and the reduce form of the per-head RMSNorm is refused at any length. At 6656 rows
+(a 4-minute song) the plain form compiles except for the 24 head-norm ops (the block-sum
+matmul, its spread matmul and the `tile`), which fall to the CPU; a "spread" form of that norm
+(one block-diagonal matmul that yields each head's sum already spread across its columns, with
+the matrices as program inputs, `head_norm="spread"`) is the candidate under test. Until it
+compiles, songs above 4096 rows (about 2 min 40 s) stay on the Mac (`YUE2_REMOTE_MAX_ROWS`).
+Compiles are slow on the phone (2 min for 4096 rows, 10–20 min for 6656) but cached there per
+bucket. The `com.apple.developer.kernel.increased-memory-limit` entitlement lifts the app's
+ceiling from 3.4 GB to about 6 GB on a 12 GB phone; the 2.8 GB of fp16 weights are stored
+once in the app's container and memory-mapped.
+
+Measured end to end (`tools/remote_probe.py`, 75-second song, 4 steps): the phone's latents
+correlate 0.999989 with the Mac's Neural Engine (0.46% RMS), the weight transfer runs at
+34 MB/s over Wi-Fi (85 s, once), and with two draft songs queued the scheduler put one on
+each Neural Engine and finished both in 99 s instead of about 130 s.
+
+Protocol (`src/yue2/remote/protocol.py`, `app/YuERemote/Sources/Protocol.swift`): TCP frames of
+`u32 header length | JSON header | u64 payload length | payload`. Ops: `hello`, `weights_begin`
+/ `weights_layer` / `weights_end` (2.8 GB, once), `program` (the mlpackage files, compiled on the
+phone), `open` (bucket and real lengths), `kv` (a layer's prefix keys and values, fp16
+unpadded), `tables` (rotary tables and key bias), `velocity` (x in, h out, fp16 `[S, D]`),
+`close`, `ping`. Per pass the Mac sends and receives `S × 2048 × 2` bytes (27 MB each way for a
+4-minute song); per song it sends about 400 MB of prefix K/V and gets 1.7 MB of latents back.
+
+The Mac app finds the phone with Bonjour (`_yuestudio._tcp`) and hands the worker its address
+(`{"cmd": "remote", "host", "port", "name"}`); the worker treats it as a third engine
+(`Scheduler.remote_synth`): after the internal Neural Engine has taken the top song that wants
+it, the phone takes the next song the user allowed a Neural Engine for, waiting or already on
+the GPU (which then hands over mid-trajectory, `nar_switch` with `may_switch()` returning
+`"remote"`). A song the phone cannot run (its compiler rejects the length, or the connection
+drops) goes back to the queue for the Mac. `engine="remote"` in `yue2.nar.synthesize` and
+`RemoteVelocity` in `src/yue2/remote/velocity.py` mirror the `ANEVelocity` contract.

@@ -73,11 +73,14 @@ def _rms(x, w, eps):
     return mx.fast.rms_norm(x, w, eps)
 
 
-@mx.compile
 def _swiglu(gu):
     """SiLU(gate) * up on the fused gate/up projection, as one kernel."""
     g, u = mx.split(gu, 2, axis=-1)
     return g * mx.sigmoid(g) * u
+
+
+if mx is not None:   # decorating at import time would fail where MLX is absent
+    _swiglu = mx.compile(_swiglu)
 
 
 class MLXVelocity:

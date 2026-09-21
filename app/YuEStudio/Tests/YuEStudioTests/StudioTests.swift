@@ -144,4 +144,50 @@ final class StudioTests: XCTestCase {
         XCTAssertEqual(players.position, 4, accuracy: 0.4)
         players.forget(song); XCTAssertNil(players.currentSong); XCTAssertEqual(players.position, 0)
     }
+    func testTitleFallbackSkipsSectionsAndSupportsInstrumentals() {
+        XCTAssertEqual(TitleSuggester.fallback(lyrics: "[Verse]\n\nWalking home under autumn skies tonight", style: "", instrumental: false), "Walking Home Under Autumn Skies")
+        XCTAssertEqual(TitleSuggester.fallback(lyrics: "Old song words", style: "warm acoustic piano ballad with strings", instrumental: true), "Warm Acoustic Piano Ballad")
+        XCTAssertEqual(TitleSuggester.fallback(lyrics: "[Outro]", style: "cinematic ambient", instrumental: false), "Cinematic Ambient")
+    }
+
+    func testUpstreamResultMetadataAndForkRenamePrecedence() throws {
+        let root = try fixture(), directory = root.appendingPathComponent("20260921-120000-Title/song1")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data().write(to: directory.appendingPathComponent("audio.flac"))
+        try JSONSerialization.data(withJSONObject: ["title": "Upstream title", "nar_engine": "mlx+remote", "quality": "draft"]).write(to: directory.appendingPathComponent("result.json"))
+        var song = try XCTUnwrap(Song.scan(root).first)
+        XCTAssertEqual(song.title, "Upstream title")
+        XCTAssertEqual(song.engineLabel, "GPU, then iPhone")
+        XCTAssertEqual(song.quality, "draft")
+        try JSONSerialization.data(withJSONObject: ["title": "My rename", "kind": "COVER", "source_path": "/source.wav"]).write(to: directory.appendingPathComponent("metadata.json"))
+        song = try XCTUnwrap(Song.scan(root).first)
+        XCTAssertEqual(song.title, "My rename")
+        XCTAssertEqual(song.kind, "COVER")
+        XCTAssertEqual(song.sourcePath, "/source.wav")
+    }
+
+    @MainActor func testRemoteEventsAndMigrationKeepSongMetadata() throws {
+        let backend = Backend()
+        func event(_ object: [String: Any]) throws {
+            var data = try JSONSerialization.data(withJSONObject: object); data.append(10)
+            backend.consume(data)
+        }
+        try event(["event": "remote", "state": "connected", "name": "Test iPhone", "detail": "weights cached"])
+        XCTAssertEqual(backend.remoteStatus, "Test iPhone ready · weights cached")
+        backend.songs = [Song(run: "test", index: 1, path: "/test/audio.flac", score: "ABC", seconds: 1, seed: 1, truncated: false, status: .synth, fraction: 0.5, title: "Cover", kind: "COVER")]
+        try event(["event": "stage", "path": "/test/audio.flac", "stage": "synth", "engine": "mlx+remote"])
+        XCTAssertEqual(backend.songs[0].engineLabel, "GPU, then iPhone")
+        XCTAssertEqual(backend.songs[0].fraction, 0.5)
+        XCTAssertEqual(backend.songs[0].kind, "COVER")
+        try event(["event": "remote", "state": "gone", "name": "Test iPhone"])
+        XCTAssertEqual(backend.remoteStatus, "Test iPhone disconnected")
+    }
+
+    @MainActor func testRemoteOfferBeforeWorkerReadyDoesNotReportError() {
+        let backend = Backend()
+        backend.useRemote(RemoteBrowser.Phone(name: "Test", host: "127.0.0.1", port: 1234))
+        XCTAssertNil(backend.errorMessage)
+        XCTAssertFalse(backend.busy)
+    }
+
 }

@@ -2,6 +2,8 @@
 
 A cover starts with a readable composition: transcribe the source recording, review the melody, then ask YuE2 to realize it in a new style. The general YuE2 checkpoint supports this workflow without cover-specific fine-tuning.
 
+In YuE Studio this whole flow is one button: **Transcribe recording…** under the ABC score field picks an audio file, installs SheetSage2 on first use (own environment and weights, about 2 GB), decodes with macOS's afconvert (no FFmpeg needed), and after review fills the ABC field with Planning set to melody. The steps below are the manual command-line equivalent, and the way to set up `.venv-sheetsage2` for development (`swift run`) builds.
+
 ## 1. Set up SheetSage2 separately
 
 SheetSage2 and YuE2 use different dependency versions. Keep separate environments and exchange ABC and audio files. Run transcription and generation sequentially so they can share one GPU.
