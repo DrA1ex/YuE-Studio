@@ -261,7 +261,7 @@ struct ContentView: View {
                     }
                     editorCard(title: "More Options", expanded: $showOptions) {
                         VStack(alignment: .leading, spacing: 12) {
-                            if mode == "cover" { Text("Planning: preserve source melody").font(.caption).foregroundStyle(.secondary) }
+                            if mode == "cover" { Text(abcOpen ? "Planning: continue source melody" : "Planning: preserve source melody").font(.caption).foregroundStyle(.secondary) }
                             else { Picker("Planning", selection: $cot) { Text("Full score").tag("full"); Text("Melody").tag("melody"); Text("Direct").tag("off") }.pickerStyle(.segmented) }
                             Picker("Synthesis", selection: $engines) {
                                 Text("GPU only").tag("gpu")
@@ -512,7 +512,7 @@ struct ContentView: View {
             let seconds = abcOpen ? maxSeconds : min(source?.seconds ?? maxSeconds, 360)
             backend.generate(title: finalTitle, style: style, lyrics: lyrics, cot: "melody", seed: seed, randomSeed: randomSeed, batch: batch, maxTokens: Int(seconds * 25), quality: quality, instrumental: instrumental, abc: abc, kind: "COVER", sourcePath: source?.path, promptFidelity: promptFidelity, styleFidelity: styleFidelity, sourceFidelity: sourceFidelity, targetSeconds: abcOpen ? nil : seconds, engines: engines, abcOpen: abcOpen)
         } else {
-            backend.generate(title: finalTitle, style: style, lyrics: lyrics, cot: abc.isEmpty ? cot : "melody", seed: seed, randomSeed: randomSeed, batch: batch, maxTokens: Int(maxSeconds * 25), quality: quality, instrumental: instrumental, abc: abc, kind: "GENERATED", sourcePath: nil, promptFidelity: promptFidelity, styleFidelity: styleFidelity, sourceFidelity: 0, targetSeconds: nil, engines: engines, abcOpen: abcOpen)
+            backend.generate(title: finalTitle, style: style, lyrics: lyrics, cot: !abc.isEmpty && cot == "off" ? "melody" : cot, seed: seed, randomSeed: randomSeed, batch: batch, maxTokens: Int(maxSeconds * 25), quality: quality, instrumental: instrumental, abc: abc, kind: "GENERATED", sourcePath: nil, promptFidelity: promptFidelity, styleFidelity: styleFidelity, sourceFidelity: 0, targetSeconds: nil, engines: engines, abcOpen: abcOpen)
         }
     }
 
