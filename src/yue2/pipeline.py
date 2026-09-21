@@ -16,6 +16,12 @@ from .sampling import generate_tokens, synchronize
 from .progress import Progress
 
 
+def complete_score_ids(request, tokenizer, generated):
+    """The exact score IDs of a plan: an open opening's tokens followed by what the planner wrote."""
+    opening = list(tokenizer.encode(request.abc)) if (request.abc is not None and request.abc_open) else []
+    return opening + list(generated)
+
+
 @dataclass
 class SymbolicPlan:
     request: SongRequest
@@ -267,7 +273,7 @@ class YuE2Pipeline:
         request = request or self._request(style, lyrics, tags=tags, **kwargs)
         if request.cot == "off":
             return SymbolicPlan(request, None, [], token_prefixes(request, self.tokenizer))
-        if request.abc is not None:
+        if request.abc is not None and not request.abc_open:
             with self._status("Using provided score"):
                 ids = self.tokenizer.encode(request.abc)
                 return SymbolicPlan(request, request.abc, ids, token_prefixes(request, self.tokenizer, ids),
@@ -275,6 +281,7 @@ class YuE2Pipeline:
         sampling = resolve_sampling(abc_sampling, self.generation_config.abc)
         ids, timing, truncated = self._generate(token_prefixes(request, self.tokenizer), sampling,
                             request.seed, "abc", cancelled=cancelled, on_token=on_token)
+        ids = complete_score_ids(request, self.tokenizer, ids)
         return SymbolicPlan(request, self.tokenizer.decode(ids), ids,
                             token_prefixes(request, self.tokenizer, ids), timing, truncated)
 

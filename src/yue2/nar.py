@@ -328,7 +328,10 @@ def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
             # Compile (or load) the bucket's programs before taking the device lock: the compiler
             # can run for minutes and needs no PyTorch work.
             S, P = ane_runtime.buckets_for((len(chunk.noise) + 2, len(chunk.ar_tokens)))
-            ane_runtime.programs_for(model).ensure(S, P, on_progress=on_prepare)
+            programs = ane_runtime.programs_for(model)
+            if (S, P) not in programs.loaded:
+                phase(f"compiling the Neural Engine program for {S} rows (a few seconds to ~8 minutes, longer for longer songs)")
+            programs.ensure(S, P, on_progress=on_prepare)
         phase("prefilling the prefix on the GPU")
         with lock:
             engine = CachedNAR(model, chunk, attention, query_chunk_size)

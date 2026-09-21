@@ -86,6 +86,7 @@ class SongRequest:
     abc: str | None = None
     cfg_scale: float | None = None
     id: str = "song"
+    abc_open: bool = False        # ``abc`` is an opening (e.g. a hummed melody): the planner continues it
 
     def __post_init__(self):
         if self.cot not in INSTRUCTIONS:
@@ -100,6 +101,8 @@ class SongRequest:
             raise ValueError("External ABC requires nonempty text and cot=melody/full")
         if self.cfg_scale is not None and (not math.isfinite(self.cfg_scale) or not 0 <= self.cfg_scale <= 20):
             raise ValueError("cfg_scale must be finite and in [0,20]")
+        if self.abc_open and self.abc is None:
+            raise ValueError("abc_open needs an abc opening to continue")
 
     @property
     def guidance(self):
@@ -113,12 +116,20 @@ class SongRequest:
 
 
 def token_prefixes(request, tokenizer, abc_ids=None):
+    """The prompt for the planner (``abc_ids`` None) or for the semantic stage (exact score IDs).
+
+    With an open score (``request.abc_open``) the planner prompt ends inside the score, after the
+    opening's tokens, so the model continues the melody; the semantic prompt then carries the
+    opening plus the continuation as ``abc_ids``.
+    """
     base = [EOD] + tokenizer.encode(request.text())
     if request.cot == "off":
         return base + [ABC_START, ABC_END, MUSIC_START]
     if abc_ids is None:
         if request.abc is None:
             return base + [ABC_START]
+        if request.abc_open:
+            return base + [ABC_START] + list(tokenizer.encode(request.abc))
         abc_ids = tokenizer.encode(request.abc)
     abc_ids = list(abc_ids)
     if any(type(token) is not int or not 0 <= token < EOD for token in abc_ids):

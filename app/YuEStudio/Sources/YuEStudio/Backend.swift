@@ -235,11 +235,11 @@ final class Backend: ObservableObject {
 
     func generate(title: String, style: String, lyrics: String, cot: String, seed: Int, randomSeed: Bool, batch: Int,
                   maxTokens: Int, quality: String, instrumental: Bool, abc: String, kind: String, sourcePath: String?,
-                  promptFidelity: Double, styleFidelity: Double, sourceFidelity: Double, targetSeconds: Double?, engines: String = "gpu+ane") {
+                  promptFidelity: Double, styleFidelity: Double, sourceFidelity: Double, targetSeconds: Double?, engines: String = "gpu+ane", abcOpen: Bool = false) {
         var request: [String: Any] = ["cmd": "generate", "title": title, "style": style, "lyrics": lyrics,
                                        "cot": cot, "seed": seed, "random_seed": randomSeed, "batch": batch,
                                        "max_tokens": maxTokens, "quality": quality, "engines": engines, "instrumental": instrumental,
-                                       "abc": abc, "kind": kind, "prompt_fidelity": promptFidelity,
+                                       "abc": abc, "abc_open": abcOpen, "kind": kind, "prompt_fidelity": promptFidelity,
                                        "style_fidelity": styleFidelity, "source_fidelity": sourceFidelity]
         if let sourcePath { request["source_path"] = sourcePath }
         if let targetSeconds { request["target_seconds"] = targetSeconds }

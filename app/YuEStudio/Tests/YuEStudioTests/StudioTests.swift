@@ -190,4 +190,29 @@ final class StudioTests: XCTestCase {
         XCTAssertFalse(backend.busy)
     }
 
+    @MainActor func testHumTranscriptionKeepsCPUCacheAndSkipsWhisper() {
+        let audio = URL(fileURLWithPath: "/tmp/hum.wav"), output = URL(fileURLWithPath: "/tmp/hum-out")
+        let mlx = URL(fileURLWithPath: "/tmp/whisper/python")
+        let hum = Backend.transcriptionArguments(audio: audio, output: output, hum: true, mlxPython: mlx)
+        XCTAssertTrue(hum.contains("--hum"))
+        XCTAssertFalse(hum.contains("--mlx-python"))
+        XCTAssertTrue(hum.contains(Paths.coverAnalyses.path))
+        XCTAssertTrue(hum.contains("fp32")); XCTAssertTrue(hum.contains("cpu"))
+        let cover = Backend.transcriptionArguments(audio: audio, output: output, hum: false, mlxPython: mlx)
+        XCTAssertFalse(cover.contains("--hum"))
+        XCTAssertEqual(Array(cover.suffix(2)), ["--mlx-python", mlx.path])
+    }
+
+    @MainActor func testDiscardHumRemovesOnlyItsRecording() throws {
+        let root = try fixture(), recording = root.appendingPathComponent("hum.wav"), other = root.appendingPathComponent("source.wav")
+        try writeAudio(recording); try writeAudio(other)
+        let recorder = HumRecorder(); recorder.state = .done(recording)
+        recorder.deactivate() // leaving review must preserve the selected recording
+        XCTAssertTrue(FileManager.default.fileExists(atPath: recording.path))
+        recorder.discard()
+        XCTAssertEqual(recorder.state, .idle)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: recording.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: other.path))
+    }
+
 }

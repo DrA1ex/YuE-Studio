@@ -85,3 +85,12 @@ The initial integration exported no DMG and did not replace the installed
 app/runtime/models. The subsequent authorized export is documented in
 [release 0.4.0-ui.1](release-notes/v0.4.0-ui.1.md), including DMG/IPA integrity checks.
 The previous exported Mac app and DMG were preserved locally.
+
+## Post-release alignment (0.4.0-ui.2)
+
+The subsequent merge includes upstream main through `69e85c7`, including
+`6163abf` (hum recording/open-score continuation) and `69e85c7` (explicit ANE
+compilation phase). The earlier release-only boundary above describes ui.1.
+The hum feature is adapted to the fork's Create pane, dark score review and
+existing analysis coordinator; full cover analysis is retained. See the
+[ui.2 release notes](release-notes/v0.4.0-ui.2.md) for UI paths and validation.

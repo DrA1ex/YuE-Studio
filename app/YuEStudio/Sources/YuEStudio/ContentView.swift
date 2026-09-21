@@ -29,6 +29,12 @@ struct ContentView: View {
     @State private var titleAuto = ""
     @State private var title = ""
     @State private var abc = ""
+    @State private var abcOpen = false
+    @State private var humming = false
+    @State private var humReview = false
+    @State private var humScore = ""
+    @State private var humContinue = true
+    @State private var humError = ""
     @State private var mode = "new"
     @State private var selectedTab = "Create"
     @State private var source: AudioSource?
@@ -99,6 +105,7 @@ struct ContentView: View {
                 }
             }.padding(24).frame(width: 480)
         }
+        .onChange(of: abc) { _, text in if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { abcOpen = false } }
         .onChange(of: lyrics) { old, _ in
             if restoringLyrics { restoringLyrics = false }
             else { undoLyrics.append(old); if undoLyrics.count > 100 { undoLyrics.removeFirst() }; redoLyrics.removeAll() }
@@ -116,6 +123,50 @@ struct ContentView: View {
             Button("Move to Trash", role: .destructive) { backend.clearCoverAnalysisCache() }
         } message: {
             Text("Reusable melody, lyric, genre and style evidence will be removed. The next analysis will start from zero; songs and source audio stay in the library.")
+        }
+        .sheet(isPresented: $humming) {
+            HumSheetView { url in
+                humming = false
+                humScore = ""; humError = ""; humContinue = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    humReview = true
+                    let recording = AudioSource(id: url.path, path: url.path, title: "Hummed melody", seconds: 30, kind: "HUM")
+                    backend.transcribe(recording, hum: true) { result in
+                        switch result {
+                        case .success(let analysis): humScore = analysis.score
+                        case .failure(let error): humError = error.localizedDescription
+                        }
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $humReview) {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Your melody").font(.title2).bold()
+                if backend.coverBusy {
+                    ProgressView(backend.coverStatus)
+                } else if !humError.isEmpty {
+                    Text(humError).foregroundStyle(.red)
+                } else {
+                    Text("Review the transcribed notes, then choose how to use them.").foregroundStyle(.secondary)
+                    TextEditor(text: $humScore).font(.system(.body, design: .monospaced))
+                    Picker("Use melody", selection: $humContinue) {
+                        Text("Continue from my melody").tag(true)
+                        Text("Use the complete melody").tag(false)
+                    }.pickerStyle(.segmented)
+                }
+                HStack {
+                    Button("Cancel") { backend.cancelCover(); humReview = false }
+                    Spacer()
+                    Button("Use melody") {
+                        abc = humScore; abcOpen = humContinue; cot = "melody"
+                        source = nil; mode = "new"; selectedTab = "Create"; showOptions = true
+                        transcriptionError = ""; suggestedGenre = ""; analysisWarnings = []
+                        humReview = false
+                    }.buttonStyle(.borderedProminent)
+                        .disabled(backend.coverBusy || !humError.isEmpty || humScore.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }.padding(24).frame(width: 660, height: 460).interactiveDismissDisabled(backend.coverBusy)
         }
         .sheet(isPresented: $showLyricsEditor) {
             VStack(alignment: .leading, spacing: 14) {
@@ -192,6 +243,10 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack(spacing: 0) {
                         createSourceButton("Audio", systemImage: "plus") { importSource() }.disabled(backend.coverBusy)
+                        createSourceButton("Hum a melody", systemImage: "mic") {
+                            if backend.coverRuntimeReady { humming = true }
+                            else { backend.report("Install the Melody component in Settings before recording a melody.") }
+                        }.disabled(backend.coverBusy || backend.busy)
                     }.background(card, in: Capsule())
                     if let source { sourceCard(source) }
                     editorCard(title: "Lyrics", expanded: $lyricsExpanded) {
@@ -218,7 +273,7 @@ struct ContentView: View {
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             Stepper("Variants: \(batch)", value: $batch, in: 1...8)
-                            if mode == "cover", let source {
+                            if mode == "cover", !abcOpen, let source {
                                 HStack {
                                     Text("Cover length"); Spacer()
                                     Text(timeLabel(min(source.seconds, 360))).monospacedDigit()
@@ -232,6 +287,14 @@ struct ContentView: View {
                             if mode == "cover" { fidelitySlider("Source audio fidelity", value: $sourceFidelity) }
                             HStack { TextField("Seed", value: $seed, format: .number).disabled(randomSeed); Toggle("Random", isOn: $randomSeed) }
                             HStack { Text("ABC score").font(.caption); Spacer(); Button("Import ABC") { importScore() }.disabled(backend.coverBusy) }
+                            if !abc.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Picker("Use score as", selection: $abcOpen) {
+                                    Text("Complete melody").tag(false)
+                                    Text("Opening to continue").tag(true)
+                                }
+                                Text(abcOpen ? "The planner continues your opening to the selected maximum length." : "The supplied score defines the melody.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
                             TextEditor(text: $abc).font(.system(.caption, design: .monospaced)).frame(height: 90).overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(0.1)))
                         }.padding(.top, 10)
                     }.font(.system(size: 13)).tint(.accentColor)
@@ -446,16 +509,16 @@ struct ContentView: View {
         guard backend.connected, !backend.coverBusy else { return }
         let finalTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if mode == "cover" {
-            let seconds = min(source?.seconds ?? maxSeconds, 360)
-            backend.generate(title: finalTitle, style: style, lyrics: lyrics, cot: "melody", seed: seed, randomSeed: randomSeed, batch: batch, maxTokens: Int(seconds * 25), quality: quality, instrumental: instrumental, abc: abc, kind: "COVER", sourcePath: source?.path, promptFidelity: promptFidelity, styleFidelity: styleFidelity, sourceFidelity: sourceFidelity, targetSeconds: seconds, engines: engines)
+            let seconds = abcOpen ? maxSeconds : min(source?.seconds ?? maxSeconds, 360)
+            backend.generate(title: finalTitle, style: style, lyrics: lyrics, cot: "melody", seed: seed, randomSeed: randomSeed, batch: batch, maxTokens: Int(seconds * 25), quality: quality, instrumental: instrumental, abc: abc, kind: "COVER", sourcePath: source?.path, promptFidelity: promptFidelity, styleFidelity: styleFidelity, sourceFidelity: sourceFidelity, targetSeconds: abcOpen ? nil : seconds, engines: engines, abcOpen: abcOpen)
         } else {
-            backend.generate(title: finalTitle, style: style, lyrics: lyrics, cot: cot, seed: seed, randomSeed: randomSeed, batch: batch, maxTokens: Int(maxSeconds * 25), quality: quality, instrumental: instrumental, abc: abc, kind: "GENERATED", sourcePath: nil, promptFidelity: promptFidelity, styleFidelity: styleFidelity, sourceFidelity: 0, targetSeconds: nil, engines: engines)
+            backend.generate(title: finalTitle, style: style, lyrics: lyrics, cot: abc.isEmpty ? cot : "melody", seed: seed, randomSeed: randomSeed, batch: batch, maxTokens: Int(maxSeconds * 25), quality: quality, instrumental: instrumental, abc: abc, kind: "GENERATED", sourcePath: nil, promptFidelity: promptFidelity, styleFidelity: styleFidelity, sourceFidelity: 0, targetSeconds: nil, engines: engines, abcOpen: abcOpen)
         }
     }
 
     private func importSource() {
         if let imported = backend.importAudio() {
-            source = imported; abc = imported.score; mode = "cover"; selectedTab = "Create"; transcriptionError = ""; suggestedGenre = ""; analysisWarnings = []
+            source = imported; abc = imported.score; abcOpen = false; mode = "cover"; selectedTab = "Create"; transcriptionError = ""; suggestedGenre = ""; analysisWarnings = []
             maxSeconds = min(imported.seconds, 360)
             if backend.coverRuntimeReady { transcribe(imported) }
         }
@@ -468,7 +531,7 @@ struct ContentView: View {
             guard self.source?.id == source.id else { return }
             switch result {
             case .success(let analysis):
-                self.source?.score = analysis.score; abc = analysis.score
+                self.source?.score = analysis.score; abc = analysis.score; abcOpen = false
                 if !analysis.lyrics.isEmpty && lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     lyrics = analysis.lyrics; self.source?.lyrics = analysis.lyrics
                 }
@@ -489,8 +552,9 @@ struct ContentView: View {
         }
     }
 
-    private func beginCover(_ song: Song) { source = backend.source(for: song); abc = song.score; mode = "cover"; selectedTab = "Create"; style = song.style; lyrics = song.lyrics; maxSeconds = min(song.seconds, 360); suggestedGenre = ""; analysisWarnings = []; transcriptionError = ""; title = (song.title.isEmpty ? "Song \(song.index)" : song.title) + " Cover" }
+    private func beginCover(_ song: Song) { abcOpen = false; source = backend.source(for: song); abc = song.score; mode = "cover"; selectedTab = "Create"; style = song.style; lyrics = song.lyrics; maxSeconds = min(song.seconds, 360); suggestedGenre = ""; analysisWarnings = []; transcriptionError = ""; title = (song.title.isEmpty ? "Song \(song.index)" : song.title) + " Cover" }
     private func reusePrompt(_ song: Song) {
+        abcOpen = false
         mode = "new"; selectedTab = "Create"; source = nil; abc = ""
         style = song.style; lyrics = song.lyrics
         instrumental = song.lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -499,12 +563,13 @@ struct ContentView: View {
     }
 
     private func resetAdvancedOptions() {
+        abcOpen = false
         cot = "full"; seed = 831001; randomSeed = false; batch = 2
         maxSeconds = mode == "cover" ? min(source?.seconds ?? 120, 360) : 120
         promptFidelity = 0.75; styleFidelity = 0.75; sourceFidelity = 1.0
         abc = mode == "cover" ? (source?.score ?? "") : ""
     }
-    private func resetForm() { title = ""; style = ""; lyrics = ""; abc = ""; source = nil; mode = "new"; suggestedGenre = ""; transcriptionError = "" }
+    private func resetForm() { abcOpen = false; title = ""; style = ""; lyrics = ""; abc = ""; source = nil; mode = "new"; suggestedGenre = ""; transcriptionError = "" }
 
     private func fidelitySlider(_ label: String, value: Binding<Double>) -> some View {
         VStack(alignment: .leading, spacing: 6) { HStack { Text(label); Spacer(); Text("\(Int(value.wrappedValue * 100))%").monospacedDigit() }; Slider(value: value, in: 0...1, step: 0.05).accessibilityLabel(label).accessibilityValue("\(Int(value.wrappedValue * 100)) percent") }
@@ -547,7 +612,7 @@ struct ContentView: View {
         let panel = NSOpenPanel(); panel.allowsMultipleSelection = false; panel.canChooseDirectories = false
         panel.allowedContentTypes = [UTType(filenameExtension: "abc") ?? .plainText, .plainText]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { abc = try String(contentsOf: url, encoding: .utf8) } catch { backend.report("Could not read score: \(error.localizedDescription)") }
+        do { abc = try String(contentsOf: url, encoding: .utf8); abcOpen = false; cot = "melody" } catch { backend.report("Could not read score: \(error.localizedDescription)") }
     }
 }
 

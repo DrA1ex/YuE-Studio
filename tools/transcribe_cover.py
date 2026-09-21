@@ -220,6 +220,7 @@ def main() -> int:
     parser.add_argument("--cache-dir", type=Path, help="Persistent directory for resumable stage evidence")
     parser.add_argument("--mlx-python", type=Path, help="Optional isolated MLX Whisper Python executable")
     parser.add_argument("--disable-separation", action="store_true", help="Use the original mix without vocal-boundary analysis")
+    parser.add_argument("--hum", action="store_true", help="Transcribe only a hummed vocal melody")
     args = parser.parse_args()
     if args.install_component:
         install_component(args.install_component)
@@ -281,6 +282,8 @@ def main() -> int:
     cache_signature = lambda **values: values
     event("loading", "Loading SheetSage2 on CPU in FP32")
     melody_signature = cache_signature(stage="melody", revision=SHEETSAGE_REVISION, dtype=args.dtype, preset="default")
+    if args.hum:
+        melody_signature["task"] = "melody-vocal"
     result = cache.load("melody", melody_signature)
     if result is not None:
         event("cache", "Reusing cached melody analysis")
@@ -298,6 +301,7 @@ def main() -> int:
         result = model.transcribe(
             waveform, sampling_rate=rate, output_dir=str(args.output), melody_only=True,
             dtype=args.dtype, preset="default", progress=progress,
+            **({"prompts": ["timestamp", "downbeat_meter", "structure", "key", "melody_vocal"]} if args.hum else {}),
         )
         score = result.get("abc")
         if not score or result.get("abc_error"):
@@ -313,6 +317,12 @@ def main() -> int:
         }, elapsed_seconds=time.monotonic() - melody_started)
     score_path = args.output / "score.abc"
     score_path.write_text(score, encoding="utf-8")
+    if args.hum:
+        analysis = {"score": score, "lyrics": "", "genre": "", "warnings": list(result.get("warnings") or []),
+                    "task": "melody-vocal", "cache_key": cache.source_sha256}
+        (args.output / "cover_analysis.json").write_text(json.dumps(analysis), encoding="utf-8")
+        event("complete", str(score_path))
+        return 0
     melody_warnings = list(result.get("warnings") or [])
     melody_diagnostics = result.get("diagnostics")
     if "model" in locals():

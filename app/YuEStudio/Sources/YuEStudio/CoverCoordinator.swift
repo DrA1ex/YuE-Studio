@@ -3,6 +3,13 @@ import AVFoundation
 
 @MainActor
 extension Backend {
+    static func transcriptionArguments(audio: URL, output: URL, hum: Bool, mlxPython: URL?) -> [String] {
+        var args = ["-u", Paths.transcriber.path, audio.path, "--output", output.path, "--cache-dir", Paths.coverAnalyses.path, "--device", "cpu", "--dtype", "fp32"]
+        if hum { args.append("--hum") }
+        else if let mlxPython { args += ["--mlx-python", mlxPython.path] }
+        return args
+    }
+
     func cancelCover() {
         coverTask?.cancel()
         if coverProcess?.isRunning == true { coverProcess?.terminate() }
@@ -18,7 +25,7 @@ extension Backend {
     }
 
     /// Drain the existing queue before releasing YuE; never run both models together.
-    func transcribe(_ source: AudioSource, completion: @escaping (Result<CoverAnalysis, Error>) -> Void) {
+    func transcribe(_ source: AudioSource, hum: Bool = false, completion: @escaping (Result<CoverAnalysis, Error>) -> Void) {
         guard !coverBusy, coverRuntimeReady else {
             completion(.failure(coverError("Install the cover engine before transcribing."))); return
         }
@@ -45,8 +52,8 @@ extension Backend {
                 try await Task.detached(priority: .userInitiated) { try AudioPreparation.writeAnalysisAudio(source: URL(fileURLWithPath: source.path), destination: normalized) }.value
                 try Task.checkCancellation()
                 coverStatus = "Analyzing melody, lyrics and genre…"
-                var arguments = ["-u", Paths.transcriber.path, normalized.path, "--output", output.path, "--cache-dir", Paths.coverAnalyses.path, "--device", "cpu", "--dtype", "fp32"]
-                if FileManager.default.isExecutableFile(atPath: Paths.coverWhisperPython.path) { arguments += ["--mlx-python", Paths.coverWhisperPython.path] }
+                let arguments = Self.transcriptionArguments(audio: normalized, output: output, hum: hum,
+                    mlxPython: FileManager.default.isExecutableFile(atPath: Paths.coverWhisperPython.path) ? Paths.coverWhisperPython : nil)
                 try await runCoverCommand(Paths.coverPython.path, arguments)
                 try Task.checkCancellation()
                 let score = try String(contentsOf: output.appendingPathComponent("score.abc"), encoding: .utf8)
@@ -65,7 +72,7 @@ extension Backend {
                     metadata["style"] = genre
                     metadata["analysis"] = analysisJSON
                     try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted]).write(to: metadataURL, options: .atomic)
-                } else {
+                } else if !hum {
                     try score.write(to: URL(fileURLWithPath: source.path).deletingLastPathComponent().appendingPathComponent("cover-score.abc"), atomically: true, encoding: .utf8)
                 }
                 rescan(); append("Audio analysis complete"); completion(.success(CoverAnalysis(score: score, lyrics: lyrics, genre: genre, warnings: warnings)))
