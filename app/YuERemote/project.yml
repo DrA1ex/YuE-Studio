@@ -17,6 +17,8 @@ targets:
         NSLocalNetworkUsageDescription: YuE Studio on your Mac connects to this phone to use its Neural Engine.
         UILaunchScreen: {}
         CFBundleDisplayName: YuE Remote
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
     settings:
       base:

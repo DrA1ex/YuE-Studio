@@ -81,6 +81,7 @@ launch on macOS 14/15, or a packaged DMG upgrade. Upstream limits phone synthesi
 4096 padded rows (roughly 2m40s); actual acceptance depends on the device. Source
 and build alignment does not certify those hardware-dependent behaviors.
 
-No DMG was exported, no release was published, and the installed app/runtime/models
-were not replaced. The local development native library was rebuilt; existing
-release artifacts remain untouched.
+The initial integration exported no DMG and did not replace the installed
+app/runtime/models. The subsequent authorized export is documented in
+[release 0.4.0-ui.1](release-notes/v0.4.0-ui.1.md), including DMG/IPA integrity checks.
+The previous exported Mac app and DMG were preserved locally.
