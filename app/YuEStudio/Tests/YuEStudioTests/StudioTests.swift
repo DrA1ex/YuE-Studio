@@ -30,6 +30,28 @@ final class StudioTests: XCTestCase {
         XCTAssertEqual(WaveformSamples.load(root.appendingPathComponent("missing.wav").path), [])
     }
 
+    func testAudioLevelMeterMapsAndClampsSyntheticLevels() {
+        XCTAssertEqual(AudioLevelMeter.normalized(decibels: -60), 0, accuracy: 0.0001)
+        XCTAssertEqual(AudioLevelMeter.normalized(decibels: -3), 1, accuracy: 0.0001)
+        XCTAssertEqual(AudioLevelMeter.normalized(decibels: -100), 0, accuracy: 0.0001)
+        XCTAssertEqual(AudioLevelMeter.normalized(decibels: 4), 1, accuracy: 0.0001)
+        XCTAssertEqual(AudioLevelMeter.normalized(decibels: .nan), 0, accuracy: 0.0001)
+    }
+
+    @MainActor func testVoiceMemoStorePersistsOnlyItsOwnAudio() throws {
+        let root = try fixture(), source = root.appendingPathComponent("idea.wav")
+        try writeAudio(source)
+        let store = VoiceMemoStore(root: root.appendingPathComponent("Voice Memos"))
+        let memo = try XCTUnwrap(store.importRecording(source, title: "Test idea"))
+        XCTAssertEqual(store.memos.first?.title, "Test idea")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.url(for: memo).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+        store.delete(memo)
+        XCTAssertTrue(store.memos.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.url(for: memo).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+    }
+
     func testNormalizationUsesAllChannelsAndPreservesDuration() throws {
         let root = try fixture(), source = root.appendingPathComponent("stereo.wav"), dest = root.appendingPathComponent("mono.wav")
         try writeAudio(source, channels: 2)

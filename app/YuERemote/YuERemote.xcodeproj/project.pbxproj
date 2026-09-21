@@ -13,6 +13,9 @@
 		97B2B1E2D8D2AE7C723EC198 /* Bench.swift in Sources */ = {isa = PBXBuildFile; fileRef = C72EFBDA2DB78B436093C842 /* Bench.swift */; };
 		9E5711505FF5BE5BE839D738 /* Protocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 232CE73718BEC175B93982E9 /* Protocol.swift */; };
 		E64D00434EEBB1A15F156D66 /* Server.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5ADBC63B904430DFD369D08 /* Server.swift */; };
+		A1B2C3D4E5F60718293A4B5C /* MemoServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A60718293A4B5C /* MemoServer.swift */; };
+		A1B2C3D4E5F60718293A4B5D /* VoiceMemo.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A60718293A4B5D /* VoiceMemo.swift */; };
+		A1B2C3D4E5F60718293A4B5E /* YuE_icon.icon in Resources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A60718293A4B5E /* YuE_icon.icon */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -23,6 +26,9 @@
 		C72EFBDA2DB78B436093C842 /* Bench.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Bench.swift; sourceTree = "<group>"; };
 		D16700F05FBF2B70DDB82451 /* Tachometer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Tachometer.swift; sourceTree = "<group>"; };
 		F5ADBC63B904430DFD369D08 /* Server.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Server.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A60718293A4B5C /* MemoServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoServer.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A60718293A4B5D /* VoiceMemo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceMemo.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A60718293A4B5E /* YuE_icon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = ../../icons/YuE_icon.icon; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -31,6 +37,7 @@
 			children = (
 				F81EFD658233C79122C1D9D3 /* Models */,
 				E22AE464B12C47F96DA5AD4F /* Sources */,
+				B1C2D3E4F5A60718293A4B5E /* YuE_icon.icon */,
 				E3D26F8C5E36F97C44EC83A2 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -42,6 +49,8 @@
 				2C4F2C93088F9C8F39052A73 /* Engine.swift */,
 				232CE73718BEC175B93982E9 /* Protocol.swift */,
 				F5ADBC63B904430DFD369D08 /* Server.swift */,
+				B1C2D3E4F5A60718293A4B5C /* MemoServer.swift */,
+				B1C2D3E4F5A60718293A4B5D /* VoiceMemo.swift */,
 				D16700F05FBF2B70DDB82451 /* Tachometer.swift */,
 				02C5F2C3E74DB485964A0DF5 /* YuERemoteApp.swift */,
 			);
@@ -70,6 +79,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 7076863413F326D9A0A63E6D /* Build configuration list for PBXNativeTarget "YuERemote" */;
 			buildPhases = (
+				C1D2E3F4A5B60718293A4B5E /* Resources */,
 				99FED04022710D9B66448D8D /* Sources */,
 			);
 			buildRules = (
@@ -117,6 +127,17 @@
 		};
 /* End PBXProject section */
 
+/* Begin PBXResourcesBuildPhase section */
+		C1D2E3F4A5B60718293A4B5E /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1B2C3D4E5F60718293A4B5E /* YuE_icon.icon in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		99FED04022710D9B66448D8D /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -126,6 +147,8 @@
 				11A476EFB61384CBDAD9C3FD /* Engine.swift in Sources */,
 				9E5711505FF5BE5BE839D738 /* Protocol.swift in Sources */,
 				E64D00434EEBB1A15F156D66 /* Server.swift in Sources */,
+				A1B2C3D4E5F60718293A4B5C /* MemoServer.swift in Sources */,
+				A1B2C3D4E5F60718293A4B5D /* VoiceMemo.swift in Sources */,
 				861B6055A5EC7A9D93D70D45 /* Tachometer.swift in Sources */,
 				937A48DB0999FEB256836659 /* YuERemoteApp.swift in Sources */,
 			);
@@ -200,7 +223,7 @@
 		CD39ACED5F08A21720794752 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = YuE_icon;
 				CODE_SIGN_ENTITLEMENTS = YuERemote.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
@@ -226,7 +249,7 @@
 		E96C6807E83AC561AE1DDF27 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = YuE_icon;
 				CODE_SIGN_ENTITLEMENTS = YuERemote.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;

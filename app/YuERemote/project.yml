@@ -10,11 +10,14 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+    resources:
+      - path: ../../icons/YuE_icon.icon
     info:
       path: Info.plist
       properties:
-        NSBonjourServices: [_yuestudio._tcp]
-        NSLocalNetworkUsageDescription: YuE Studio on your Mac connects to this phone to use its Neural Engine.
+        NSBonjourServices: [_yuestudio._tcp, _yuevoice._tcp]
+        NSLocalNetworkUsageDescription: YuE Studio on your Mac connects to this phone to use its Neural Engine and transfer saved vocal ideas.
+        NSMicrophoneUsageDescription: YuE Remote records and keeps your vocal ideas so YuE Studio can turn them into melodies.
         UILaunchScreen: {}
         CFBundleDisplayName: YuE Remote
         CFBundleShortVersionString: $(MARKETING_VERSION)
@@ -23,13 +26,15 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.halftone.YuERemote
+        ASSETCATALOG_COMPILER_APPICON_NAME: YuE_icon
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_ENTITLEMENTS: YuERemote.entitlements
         COREML_CODEGEN_LANGUAGE: None
         TARGETED_DEVICE_FAMILY: "1,2"
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_CFBundleDisplayName: YuE Remote
-        INFOPLIST_KEY_NSLocalNetworkUsageDescription: YuE Studio on your Mac connects to this phone to use its Neural Engine.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: YuE Studio on your Mac connects to this phone to use its Neural Engine and transfer saved vocal ideas.
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: YuE Remote records and keeps your vocal ideas so YuE Studio can turn them into melodies.
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
         SWIFT_VERSION: "5.0"
         MARKETING_VERSION: "0.4.0"

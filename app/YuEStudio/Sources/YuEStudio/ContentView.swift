@@ -21,6 +21,8 @@ struct ContentView: View {
     @AppStorage("engines") private var engines = "gpu+ane"
     @AppStorage("useRemote") private var useRemote = false
     @StateObject private var remote = RemoteBrowser()
+    @StateObject private var memoStore = VoiceMemoStore()
+    @StateObject private var memoRemote = VoiceMemoRemote()
     @State private var writingLyrics = false
     @State private var naming = false
     @State private var askAbout = false
@@ -87,6 +89,7 @@ struct ContentView: View {
         .onAppear {
             backend.rescan(); if backend.process == nil { backend.start() }
             if useRemote { remote.start() }
+            memoRemote.start()
             backend.remoteRetry = { if useRemote && engines == "gpu+ane" { backend.useRemote(remote.phone) } }
         }
         .onChange(of: remote.phone) { _, _ in syncRemote() }
@@ -125,7 +128,7 @@ struct ContentView: View {
             Text("Reusable melody, lyric, genre and style evidence will be removed. The next analysis will start from zero; songs and source audio stay in the library.")
         }
         .sheet(isPresented: $humming) {
-            HumSheetView { url in
+            HumSheetView(memoStore: memoStore, memoRemote: memoRemote) { url in
                 humming = false
                 humScore = ""; humError = ""; humContinue = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {

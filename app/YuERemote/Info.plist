@@ -23,9 +23,12 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_yuestudio._tcp</string>
+		<string>_yuevoice._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>YuE Studio on your Mac connects to this phone to use its Neural Engine.</string>
+	<string>YuE Studio on your Mac connects to this phone to use its Neural Engine and transfer saved vocal ideas.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>YuE Remote records and keeps your vocal ideas so YuE Studio can turn them into melodies.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

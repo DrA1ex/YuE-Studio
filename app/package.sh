@@ -38,8 +38,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSArchitecturePriority</key><array><string>arm64</string></array>
   <key>NSMicrophoneUsageDescription</key><string>YuE Studio records a hummed melody to turn it into a song.</string>
-  <key>NSLocalNetworkUsageDescription</key><string>Use an iPhone running YuE Remote to synthesize songs on its Neural Engine.</string>
-  <key>NSBonjourServices</key><array><string>_yuestudio._tcp</string></array>
+  <key>NSLocalNetworkUsageDescription</key><string>Use an iPhone running YuE Remote to synthesize songs on its Neural Engine or transfer saved vocal ideas.</string>
+  <key>NSBonjourServices</key><array><string>_yuestudio._tcp</string><string>_yuevoice._tcp</string></array>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSHumanReadableCopyright</key><string>YuE2 model: m-a-p (Apache-2.0 code, model licence applies)</string>
 </dict></plist>

@@ -7,6 +7,7 @@ struct YuERemoteApp: App {
 
 struct RootView: View {
     @StateObject private var server = Server()
+    @StateObject private var memoServer = MemoServer()
 
     var body: some View {
         NavigationStack {
@@ -34,9 +35,12 @@ struct RootView: View {
             }
             .padding()
             .navigationTitle("YuE Remote")
-            .toolbar { NavigationLink("Bench") { BenchView() } }
+            .toolbar {
+                NavigationLink("Voice ideas") { VoiceMemosView(store: memoServer.store, server: memoServer) }
+                NavigationLink("Bench") { BenchView() }
+            }
         }
-        .onAppear { server.start() }
+        .onAppear { server.start(); memoServer.start() }
     }
 
     private func row(_ label: String, _ value: String) -> some View {
