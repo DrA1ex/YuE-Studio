@@ -248,27 +248,26 @@ final class Backend: ObservableObject {
 
     func importAudio() -> AudioSource? {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.audio, .mpeg4Audio, .mp3, .wav, .aiff]
+        panel.allowedContentTypes = [.audio]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.prompt = "Import Audio"
         guard panel.runModal() == .OK, let selected = panel.url else { return nil }
         do {
             try FileManager.default.createDirectory(at: Paths.imports, withIntermediateDirectories: true)
-            let ext = selected.pathExtension.isEmpty ? "audio" : selected.pathExtension
-            let destination = Paths.imports.appendingPathComponent(UUID().uuidString).appendingPathExtension(ext)
-            let file = try AVAudioFile(forReading: selected)
+            let destination = Paths.imports.appendingPathComponent(UUID().uuidString).appendingPathExtension("wav")
+            try AudioTranscoder.importToWAV(source: selected, destination: destination)
+            let file = try AVAudioFile(forReading: destination)
             guard file.length > 0, file.processingFormat.sampleRate > 0 else { throw CocoaError(.fileReadCorruptFile) }
             let seconds = Double(file.length) / file.processingFormat.sampleRate
-            try FileManager.default.copyItem(at: selected, to: destination)
-            let source = AudioSource(id: destination.path, path: destination.path, title: selected.deletingPathExtension().lastPathComponent,
-                                     seconds: seconds)
+            let source = AudioSource(id: destination.path, path: destination.path,
+                                     title: selected.deletingPathExtension().lastPathComponent, seconds: seconds)
             let metadata: [String: Any] = ["title": source.title, "kind": "UPLOAD", "style": "", "score": ""]
             let metadataURL = destination.deletingPathExtension().appendingPathExtension("json")
             try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted]).write(to: metadataURL)
             audioSources.append(source)
             rescan()
-            append("Imported audio: \(selected.lastPathComponent)")
+            append("Imported and converted audio: \(selected.lastPathComponent)")
             return source
         } catch {
             report("Audio import failed: \(error.localizedDescription)")
@@ -312,13 +311,17 @@ final class Backend: ObservableObject {
 
     func export(_ song: Song) {
         let original = URL(fileURLWithPath: song.path)
-        let panel = NSSavePanel(); panel.nameFieldStringValue = (song.title.isEmpty ? "YuE Song" : song.title) + "." + original.pathExtension
-        panel.allowedContentTypes = [UTType(filenameExtension: original.pathExtension) ?? .audio]
-        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = (song.title.isEmpty ? "YuE Song" : song.title) + ".mp3"
+        panel.allowedContentTypes = [.mp3]
+        guard panel.runModal() == .OK, let selected = panel.url else { return }
+        let destination = selected.pathExtension.lowercased() == "mp3"
+            ? selected
+            : selected.appendingPathExtension("mp3")
         do {
             guard original.standardizedFileURL != destination.standardizedFileURL else { return }
-            try Data(contentsOf: original).write(to: destination, options: .atomic)
-            append("Exported audio to \(destination.lastPathComponent)")
+            try AudioTranscoder.exportMP3(source: original, destination: destination)
+            append("Exported MP3 at 320 kbps to \(destination.lastPathComponent)")
         } catch { report("Could not export audio: \(error.localizedDescription)") }
     }
 

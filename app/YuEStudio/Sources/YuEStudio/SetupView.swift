@@ -8,7 +8,7 @@ struct SetupView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Setting up YuE Studio").font(.title2).bold()
-            Text("First run only: this installs a private Python runtime, the YuE music model code, and downloads the model weights. It needs about 10 GB of disk space and an internet connection.")
+            Text("Setup installs or updates the private Python runtime, required packages, FFmpeg, and YuE model files. Existing components are reused, so app updates only fetch what is missing. A fresh install needs about 10 GB of disk space and an internet connection.")
                 .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             ForEach(installer.steps) { step in
                 HStack {
