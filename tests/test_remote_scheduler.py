@@ -90,6 +90,23 @@ class RemoteSchedulerTests(unittest.TestCase):
                 self.sched.songs.remove(songs[0])
                 self.assertEqual(self.sched.schedule(), [(w.run_gpu, songs[1])])
 
+    def test_length_fallback_reports_why_the_iphone_was_skipped(self):
+        self.sched = w.Scheduler()
+        songs = self.songs(2, ane=True, frames=5000)
+        with patch.object(w, 'log') as logger, patch.object(w, 'emit') as emitter:
+            self.sched.schedule()
+
+        rows = w.remote_rows(songs[1])
+        logger.assert_any_call(
+            f"{songs[1].label} will use the Mac: {songs[1].frames} frames require a {rows}-row iPhone program; "
+            f"current remote limit is {w.REMOTE_MAX_ROWS}"
+        )
+        details = [call.kwargs.get('detail', '') for call in emitter.call_args_list]
+        self.assertIn(
+            f"too long for iPhone: {rows}-row program exceeds {w.REMOTE_MAX_ROWS}-row limit · using Mac",
+            details,
+        )
+
     def test_cancelled_phone_song_never_starts(self):
         songs = self.songs(2)
         songs[1].cancel.set()

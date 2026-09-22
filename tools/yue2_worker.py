@@ -180,9 +180,14 @@ REMOTE_LOCK = threading.Lock()
 REMOTE_MAX_ROWS = int(os.environ.get("YUE2_REMOTE_MAX_ROWS", 4096))   # largest bucket its compiler has accepted
 
 
-def remote_can_take(song):
+def remote_rows(song):
     from yue2.remote.client import S_STEP, bucket
-    return REMOTE is not None and song.remote_assigned and song.allow_ane and not song.remote_failed and bucket(song.frames + 2, S_STEP) <= REMOTE_MAX_ROWS
+    return bucket(song.frames + 2, S_STEP)
+
+
+def remote_can_take(song):
+    return REMOTE is not None and song.remote_assigned and song.allow_ane and not song.remote_failed \
+        and remote_rows(song) <= REMOTE_MAX_ROWS
 
 
 def set_remote(req):
@@ -421,6 +426,12 @@ class Scheduler:
         starts = []
         for song in live:
             if song.state == SYNTH_WAIT and song.remote_assigned and not remote_can_take(song):
+                rows = remote_rows(song)
+                if REMOTE is not None and song.allow_ane and not song.remote_failed and rows > REMOTE_MAX_ROWS:
+                    detail = f"too long for iPhone: {rows}-row program exceeds {REMOTE_MAX_ROWS}-row limit · using Mac"
+                    log(f"{song.label} will use the Mac: {song.frames} frames require a {rows}-row iPhone program; "
+                        f"current remote limit is {REMOTE_MAX_ROWS}")
+                    song.set_state(SYNTH_WAIT, detail, engine="ane" if song.wants_ane else "mlx")
                 song.remote_assigned = False  # fallback stays on the Mac, including after reconnect
 
         # Neural Engine: the highest-priority song that wants it, whether waiting or already on the GPU.
@@ -768,8 +779,15 @@ def run_remote(song):
         label = client.label() if client is not None else "iPhone"
         log(f"Synthesizing {song.label} on {label}: about {audio_s:.0f} s of audio, {song.quality} quality ({song.steps} steps)")
         song.set_state(SYNTHING, "preparing", engine="remote")
+        weights_started = [None]
         def on_phase(text):
             song.progress(0.0, text)
+            if text.startswith("sending weights to the iPhone:") and weights_started[0] is None:
+                weights_started[0] = time.perf_counter()
+                log(f"Sending synthesis weights to {label}")
+            elif text == "weights stored on the iPhone" and weights_started[0] is not None:
+                elapsed = time.perf_counter() - weights_started[0]
+                log(f"Synthesis weights stored on {label} in {elapsed:.0f} s")
             with SCHED.cv:
                 SCHED.remote_prefill = text.startswith("prefilling")
             SCHED.tick()
