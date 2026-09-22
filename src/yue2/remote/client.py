@@ -62,12 +62,15 @@ class RemoteClient:
         with self.lock:
             self.conn.call("weights_begin", identity=identity, layers=n)
             t0 = time.perf_counter()
+            sent = 0
             for i in range(n):
                 arrays = arrays_from_state(nar_layer_state(model, i), cfg)
-                blob = b"".join(np.ascontiguousarray(arrays[name].reshape(shapes[name])).tobytes() for name in WEIGHT_SHAPES)
-                self.conn.call("weights_layer", blob, identity=identity, layer=i)
+                parts = [np.ascontiguousarray(arrays[name].reshape(shapes[name])) for name in WEIGHT_SHAPES]
+                layer_bytes = sum(part.nbytes for part in parts)
+                self.conn.call_parts("weights_layer", parts, identity=identity, layer=i)
+                sent += layer_bytes
                 if on_progress is not None:
-                    mb = (i + 1) * len(blob) / 2**20
+                    mb = sent / 2**20
                     on_progress(f"sending weights to the iPhone: layer {i + 1}/{n} ({mb / max(time.perf_counter() - t0, 1e-3):.0f} MB/s)")
             self.conn.call("weights_end", identity=identity)
         self.info["weights"] = identity

@@ -31,9 +31,10 @@ final class Server: ObservableObject {
         engine.log = { [weak self] line in Task { @MainActor in self?.say(line) } }
         weights = engine.weightsIdentity.map { "cached (\($0))" } ?? "none yet"
         do {
+            // Keep the multi-gigabyte weight upload on infrastructure Wi-Fi instead of
+            // opting into Apple's peer-to-peer path when both devices already share a LAN.
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
-            params.includePeerToPeer = true
             let l = try NWListener(using: params)
             let txt = NWTXTRecord(["version": String(Self.version), "model": Bench.machine()])
             l.service = NWListener.Service(name: UIDevice.current.name, type: Self.serviceType, txtRecord: txt)

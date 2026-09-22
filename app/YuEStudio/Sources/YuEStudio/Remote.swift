@@ -13,8 +13,9 @@ final class RemoteBrowser: ObservableObject {
 
     func start() {
         guard browser == nil else { return }
+        // Both devices are expected on the same LAN. Opting into Apple peer-to-peer Wi-Fi
+        // can move discovery onto a slower path and keep that radio active during bulk transfers.
         let params = NWParameters.tcp
-        params.includePeerToPeer = true
         let b = NWBrowser(for: .bonjour(type: "_yuestudio._tcp", domain: nil), using: params)
         b.stateUpdateHandler = { [weak self] state in
             Task { @MainActor in
