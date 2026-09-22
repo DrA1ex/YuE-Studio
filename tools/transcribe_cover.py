@@ -220,6 +220,9 @@ def main() -> int:
     parser.add_argument("--cache-dir", type=Path, help="Persistent directory for resumable stage evidence")
     parser.add_argument("--mlx-python", type=Path, help="Optional isolated MLX Whisper Python executable")
     parser.add_argument("--disable-separation", action="store_true", help="Use the original mix without vocal-boundary analysis")
+    parser.add_argument("--skip-lyrics", action="store_true", help="Skip lyric transcription and its preprocessing stages")
+    parser.add_argument("--skip-genre", action="store_true", help="Skip genre classification")
+    parser.add_argument("--skip-style", action="store_true", help="Skip CLAP detailed style analysis")
     parser.add_argument("--hum", action="store_true", help="Transcribe only a hummed vocal melody")
     args = parser.parse_args()
     if args.install_component:
@@ -330,222 +333,248 @@ def main() -> int:
     gc.collect()
 
     duration = len(waveform) / float(rate)
-    structure_signature = cache_signature(stage="structure", revision=STRUCTURE_REVISION, sample_rate=rate)
-    structure_stage = cache.load("structure", structure_signature)
-    if structure_stage is not None:
-        event("cache", "Reusing cached acoustic structure evidence")
-        acoustic_structure = structure_stage
-    else:
-        structure_started = time.monotonic()
-        event("structure", "Analyzing acoustic repetitions and tempo")
-        acoustic_structure = analyze_acoustic_structure(waveform, rate)
-        cache.save("structure", structure_signature, acoustic_structure, elapsed_seconds=time.monotonic() - structure_started)
-
-    separation_signature = cache_signature(stage="voice_activity", revision=SEPARATION_REVISION, model=SEPARATION_MODEL_NAME, sample_rate=rate)
-    separation_stage = cache.load("voice_activity", separation_signature)
+    acoustic_structure = {}
     vocal_windows = None
-    separation_status = "unavailable"
-    if args.disable_separation:
-        separation_status = "disabled"
-        event("structure", "Vocal-boundary analysis disabled; using the original mix")
-    elif separation_stage is not None:
-        event("cache", "Reusing cached vocal-boundary windows")
-        vocal_windows = [tuple(window) for window in separation_stage.get("windows", [])]
-        separation_status = separation_stage.get("status", "cached")
-    elif separation_model_available():
-        separation_started = time.monotonic()
-        try:
-            event("separation", "Finding singing windows with Hybrid Demucs")
-            activity = separate_vocal_activity(stereo_waveform, rate)
-            vocal_windows = activity_windows(activity["scores"], activity["frame_seconds"], duration)
-            separation_status = "complete"
-            cache.save("voice_activity", separation_signature, {
-                "windows": vocal_windows,
-                "status": separation_status,
-                "model": SEPARATION_MODEL_NAME,
-                "revision": SEPARATION_REVISION,
-                "frame_seconds": activity["frame_seconds"],
-                "score_count": len(activity["scores"]),
-            }, elapsed_seconds=time.monotonic() - separation_started)
-        except (OSError, RuntimeError, ValueError) as exc:
-            cache.fail("voice_activity", separation_signature, str(exc))
-            event("warning", f"Vocal-boundary analysis unavailable; using the original mix: {exc}")
-    else:
-        event("warning", "Hybrid Demucs is not installed; using the original mix for transcription")
+    separation_status = "disabled" if args.skip_lyrics or args.disable_separation else "unavailable"
+    speech_result = {"text": "", "chunks": []}
+    lyrics = ""
+    alignment_warnings = []
+    timestamp_mode = "disabled"
+    silent_words = 0
+    lyrics_diagnostics = []
+    backend = "disabled"
+    lyrics_model = "disabled"
+    lyrics_revision = ""
 
-    speech = _resample(waveform.astype(np.float32, copy=False), rate, 16000)
-    mlx_model_path = None
-    if args.mlx_python and args.mlx_python.is_file():
-        mlx_model_path = resolve_mlx_model()
-    try:
-        whisper_path, transformer_model, transformer_revision = resolve_whisper_model()
-    except FileNotFoundError:
-        whisper_path, transformer_model, transformer_revision = None, WHISPER_MODEL, WHISPER_REVISION
-    backend = "mlx" if mlx_model_path else "transformers"
-    lyrics_model = MLX_MODEL if backend == "mlx" else transformer_model
-    lyrics_revision = MLX_REVISION if backend == "mlx" else transformer_revision
-    lyrics_signature = cache_signature(stage="lyrics", backend=backend, revision=lyrics_revision,
-                                       timestamp_mode="segment", num_beams=1,
-                                       condition_on_prev_tokens=False, windowing=separation_status)
-    lyrics_stage = cache.load("lyrics", lyrics_signature)
-    if lyrics_stage is not None:
-        event("cache", "Reusing cached lyric transcription")
-        speech_result = lyrics_stage["speech_result"]
-        lyrics = lyrics_stage["lyrics"]
-        alignment_warnings = lyrics_stage.get("alignment_warnings", [])
-        timestamp_mode = lyrics_stage.get("timestamp_mode", "segment")
-        silent_words = int(lyrics_stage.get("silent_words", 0))
-        lyrics_diagnostics = lyrics_stage.get("segment_diagnostics", segment_diagnostics(speech_result))
-        backend = lyrics_stage.get("backend", backend)
-        lyrics_model = lyrics_stage.get("model", lyrics_model)
-        lyrics_revision = lyrics_stage.get("revision", lyrics_revision)
-    else:
-        lyrics_started = time.monotonic()
-        alignment_warnings = []
-        speech_result = None
-        timestamp_mode = "segment"
-        if backend == "mlx":
+    if not args.skip_lyrics:
+        duration = len(waveform) / float(rate)
+        structure_signature = cache_signature(stage="structure", revision=STRUCTURE_REVISION, sample_rate=rate)
+        structure_stage = cache.load("structure", structure_signature)
+        if structure_stage is not None:
+            event("cache", "Reusing cached acoustic structure evidence")
+            acoustic_structure = structure_stage
+        else:
+            structure_started = time.monotonic()
+            event("structure", "Analyzing acoustic repetitions and tempo")
+            acoustic_structure = analyze_acoustic_structure(waveform, rate)
+            cache.save("structure", structure_signature, acoustic_structure, elapsed_seconds=time.monotonic() - structure_started)
+
+        separation_signature = cache_signature(stage="voice_activity", revision=SEPARATION_REVISION, model=SEPARATION_MODEL_NAME, sample_rate=rate)
+        separation_stage = cache.load("voice_activity", separation_signature)
+        vocal_windows = None
+        separation_status = "unavailable"
+        if args.disable_separation:
+            separation_status = "disabled"
+            event("structure", "Vocal-boundary analysis disabled; using the original mix")
+        elif separation_stage is not None:
+            event("cache", "Reusing cached vocal-boundary windows")
+            vocal_windows = [tuple(window) for window in separation_stage.get("windows", [])]
+            separation_status = separation_stage.get("status", "cached")
+        elif separation_model_available():
+            separation_started = time.monotonic()
             try:
-                event("lyrics", "Transcribing sung text with MLX Whisper on Apple Silicon")
-                worker = Path(__file__).with_name("mlx_whisper_worker.py")
-                speech_result = _run_mlx_transcription(args.mlx_python, worker, mlx_model_path, speech, args.output, vocal_windows)
+                event("separation", "Finding singing windows with Hybrid Demucs")
+                activity = separate_vocal_activity(stereo_waveform, rate)
+                vocal_windows = activity_windows(activity["scores"], activity["frame_seconds"], duration)
+                separation_status = "complete"
+                cache.save("voice_activity", separation_signature, {
+                    "windows": vocal_windows,
+                    "status": separation_status,
+                    "model": SEPARATION_MODEL_NAME,
+                    "revision": SEPARATION_REVISION,
+                    "frame_seconds": activity["frame_seconds"],
+                    "score_count": len(activity["scores"]),
+                }, elapsed_seconds=time.monotonic() - separation_started)
             except (OSError, RuntimeError, ValueError) as exc:
-                event("warning", f"MLX Whisper unavailable; using Transformers fallback: {exc}")
-                alignment_warnings.append(f"MLX Whisper unavailable; used the Transformers fallback: {exc}")
-                backend = "transformers"
-                lyrics_model = transformer_model
-                lyrics_revision = transformer_revision
-                lyrics_signature = cache_signature(stage="lyrics", backend=backend, revision=lyrics_revision,
-                                                   timestamp_mode="segment", num_beams=1,
-                                                   condition_on_prev_tokens=False, windowing=separation_status)
-        if speech_result is None:
-            if whisper_path is None:
-                event("warning", "Whisper is not installed; continuing without lyric transcription")
-                cache.fail("lyrics", lyrics_signature, "No complete Whisper model is installed")
-                speech_result = {"text": "", "chunks": []}
-                backend = "unavailable"
-                lyrics_model = "unavailable"
-                lyrics_revision = ""
-            else:
-                event("lyrics", f"Transcribing sung text with {transformer_model}")
-                recognizer = pipeline(
-                    "automatic-speech-recognition", model=whisper_path, pipeline_class=RobustWhisperPipeline,
-                    device=-1, torch_dtype=torch.float32, model_kwargs={"local_files_only": True, "attn_implementation": "eager"},
-                )
-                recognizer.model.generation_config.forced_decoder_ids = None
-                recognizer.model.config.forced_decoder_ids = None
-                recognizer.generation_config.forced_decoder_ids = None
-                windows = vocal_windows or [(0.0, duration)]
-                results = []
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", message=r"The input name `inputs` is deprecated.*", category=FutureWarning)
-                    warnings.filterwarnings("ignore", message=r"Passing a tuple of `past_key_values` is deprecated.*", category=FutureWarning)
-                    with torch.inference_mode():
-                        for start, end in windows:
-                            left = max(0, int(start * 16000))
-                            right = min(len(speech), max(left + 16000, int(end * 16000)))
-                            clip = speech[left:right]
-                            result = recognizer(clip, return_timestamps=True, generate_kwargs={
-                                "task": "transcribe", "condition_on_prev_tokens": False, "num_beams": 1,
-                                "compression_ratio_threshold": 2.4, "logprob_threshold": -1.0,
-                                "no_speech_threshold": 0.6, "temperature": (0.0, 0.2, 0.4), "return_legacy_cache": False,
-                            })
-                            results.append((result, left / 16000.0, right / 16000.0))
-                            alignment_warnings.extend(getattr(recognizer, "alignment_warnings", []))
-                speech_result = _merge_transcription_results(results)
-                timestamp_mode = recognizer.timestamp_mode
-                del recognizer
-        filtered_speech, silent_words = filter_silent_words(speech_result, speech, 16000)
-        speech_result = filtered_speech
-        lyrics = format_lyrics(speech_result, acoustic_structure)
-        lyrics_diagnostics = segment_diagnostics(speech_result)
-        cache.save("lyrics", lyrics_signature, {
-            "speech_result": speech_result,
-            "lyrics": lyrics,
-            "alignment_warnings": alignment_warnings,
-            "timestamp_mode": timestamp_mode,
-            "silent_words": silent_words,
-            "segment_diagnostics": lyrics_diagnostics,
-            "model": lyrics_model,
-            "revision": lyrics_revision,
-            "backend": backend,
-            "window_count": len(vocal_windows or [(0.0, duration)]),
-        }, elapsed_seconds=time.monotonic() - lyrics_started)
-    gc.collect()
+                cache.fail("voice_activity", separation_signature, str(exc))
+                event("warning", f"Vocal-boundary analysis unavailable; using the original mix: {exc}")
+        else:
+            event("warning", "Hybrid Demucs is not installed; using the original mix for transcription")
+
+        speech = _resample(waveform.astype(np.float32, copy=False), rate, 16000)
+        mlx_model_path = None
+        if args.mlx_python and args.mlx_python.is_file():
+            mlx_model_path = resolve_mlx_model()
+        try:
+            whisper_path, transformer_model, transformer_revision = resolve_whisper_model()
+        except FileNotFoundError:
+            whisper_path, transformer_model, transformer_revision = None, WHISPER_MODEL, WHISPER_REVISION
+        backend = "mlx" if mlx_model_path else "transformers"
+        lyrics_model = MLX_MODEL if backend == "mlx" else transformer_model
+        lyrics_revision = MLX_REVISION if backend == "mlx" else transformer_revision
+        lyrics_signature = cache_signature(stage="lyrics", backend=backend, revision=lyrics_revision,
+                                           timestamp_mode="segment", num_beams=1,
+                                           condition_on_prev_tokens=False, windowing=separation_status)
+        lyrics_stage = cache.load("lyrics", lyrics_signature)
+        if lyrics_stage is not None:
+            event("cache", "Reusing cached lyric transcription")
+            speech_result = lyrics_stage["speech_result"]
+            lyrics = lyrics_stage["lyrics"]
+            alignment_warnings = lyrics_stage.get("alignment_warnings", [])
+            timestamp_mode = lyrics_stage.get("timestamp_mode", "segment")
+            silent_words = int(lyrics_stage.get("silent_words", 0))
+            lyrics_diagnostics = lyrics_stage.get("segment_diagnostics", segment_diagnostics(speech_result))
+            backend = lyrics_stage.get("backend", backend)
+            lyrics_model = lyrics_stage.get("model", lyrics_model)
+            lyrics_revision = lyrics_stage.get("revision", lyrics_revision)
+        else:
+            lyrics_started = time.monotonic()
+            alignment_warnings = []
+            speech_result = None
+            timestamp_mode = "segment"
+            if backend == "mlx":
+                try:
+                    event("lyrics", "Transcribing sung text with MLX Whisper on Apple Silicon")
+                    worker = Path(__file__).with_name("mlx_whisper_worker.py")
+                    speech_result = _run_mlx_transcription(args.mlx_python, worker, mlx_model_path, speech, args.output, vocal_windows)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    event("warning", f"MLX Whisper unavailable; using Transformers fallback: {exc}")
+                    alignment_warnings.append(f"MLX Whisper unavailable; used the Transformers fallback: {exc}")
+                    backend = "transformers"
+                    lyrics_model = transformer_model
+                    lyrics_revision = transformer_revision
+                    lyrics_signature = cache_signature(stage="lyrics", backend=backend, revision=lyrics_revision,
+                                                       timestamp_mode="segment", num_beams=1,
+                                                       condition_on_prev_tokens=False, windowing=separation_status)
+            if speech_result is None:
+                if whisper_path is None:
+                    event("warning", "Whisper is not installed; continuing without lyric transcription")
+                    cache.fail("lyrics", lyrics_signature, "No complete Whisper model is installed")
+                    speech_result = {"text": "", "chunks": []}
+                    backend = "unavailable"
+                    lyrics_model = "unavailable"
+                    lyrics_revision = ""
+                else:
+                    event("lyrics", f"Transcribing sung text with {transformer_model}")
+                    recognizer = pipeline(
+                        "automatic-speech-recognition", model=whisper_path, pipeline_class=RobustWhisperPipeline,
+                        device=-1, torch_dtype=torch.float32, model_kwargs={"local_files_only": True, "attn_implementation": "eager"},
+                    )
+                    recognizer.model.generation_config.forced_decoder_ids = None
+                    recognizer.model.config.forced_decoder_ids = None
+                    recognizer.generation_config.forced_decoder_ids = None
+                    windows = vocal_windows or [(0.0, duration)]
+                    results = []
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", message=r"The input name `inputs` is deprecated.*", category=FutureWarning)
+                        warnings.filterwarnings("ignore", message=r"Passing a tuple of `past_key_values` is deprecated.*", category=FutureWarning)
+                        with torch.inference_mode():
+                            for start, end in windows:
+                                left = max(0, int(start * 16000))
+                                right = min(len(speech), max(left + 16000, int(end * 16000)))
+                                clip = speech[left:right]
+                                result = recognizer(clip, return_timestamps=True, generate_kwargs={
+                                    "task": "transcribe", "condition_on_prev_tokens": False, "num_beams": 1,
+                                    "compression_ratio_threshold": 2.4, "logprob_threshold": -1.0,
+                                    "no_speech_threshold": 0.6, "temperature": (0.0, 0.2, 0.4), "return_legacy_cache": False,
+                                })
+                                results.append((result, left / 16000.0, right / 16000.0))
+                                alignment_warnings.extend(getattr(recognizer, "alignment_warnings", []))
+                    speech_result = _merge_transcription_results(results)
+                    timestamp_mode = recognizer.timestamp_mode
+                    del recognizer
+            filtered_speech, silent_words = filter_silent_words(speech_result, speech, 16000)
+            speech_result = filtered_speech
+            lyrics = format_lyrics(speech_result, acoustic_structure)
+            lyrics_diagnostics = segment_diagnostics(speech_result)
+            cache.save("lyrics", lyrics_signature, {
+                "speech_result": speech_result,
+                "lyrics": lyrics,
+                "alignment_warnings": alignment_warnings,
+                "timestamp_mode": timestamp_mode,
+                "silent_words": silent_words,
+                "segment_diagnostics": lyrics_diagnostics,
+                "model": lyrics_model,
+                "revision": lyrics_revision,
+                "backend": backend,
+                "window_count": len(vocal_windows or [(0.0, duration)]),
+            }, elapsed_seconds=time.monotonic() - lyrics_started)
+        gc.collect()
+
 
     genre_warnings = []
-    genre_signature = cache_signature(stage="genre", revision=GENRE_REVISION, excerpt_seconds=10, excerpt_count=3)
-    genre_stage = cache.load("genre", genre_signature)
-    if genre_stage is not None:
-        event("cache", "Reusing cached genre evidence")
-        genre_candidates = genre_stage["genre_candidates"]
-        genre_excerpt_candidates = genre_stage.get("genre_excerpt_candidates", [])
-        genre = genre_stage["genre"]
-    else:
-        genre_started = time.monotonic()
-        event("genre", "Suggesting musical genre")
-        try:
-            classifier = pipeline("audio-classification", model=snapshot_download(GENRE_MODEL, revision=GENRE_REVISION, local_files_only=True), device=-1, model_kwargs={"local_files_only": True})
-            genre_rate = int(getattr(classifier.feature_extractor, "sampling_rate", rate))
-            genre_audio = _resample(waveform.astype(np.float32, copy=False), rate, genre_rate)
-            totals = {}
-            genre_excerpt_candidates = []
-            clips = excerpts(genre_audio, genre_rate, seconds=10)
-            with torch.inference_mode():
-                for clip in clips:
-                    excerpt = []
-                    for item in classifier(clip, top_k=classifier.model.config.num_labels):
-                        label = clean_genre_label(item["label"])
-                        score_value = float(item["score"])
-                        totals[label] = totals.get(label, 0.0) + score_value / max(1, len(clips))
-                        excerpt.append({"label": label, "score": score_value})
-                    genre_excerpt_candidates.append(sorted(excerpt, key=lambda item: item["score"], reverse=True)[:3])
-            genre_candidates = [{"label": label, "score": score_value} for label, score_value in
-                                sorted(totals.items(), key=lambda item: item[1], reverse=True)[:5]]
-            genre = summarize_genre(genre_candidates, genre_excerpt_candidates)
-            cache.save("genre", genre_signature, {
-                "genre": genre,
-                "genre_candidates": genre_candidates,
-                "genre_excerpt_candidates": genre_excerpt_candidates,
-                "model": GENRE_MODEL,
-                "revision": GENRE_REVISION,
-            }, elapsed_seconds=time.monotonic() - genre_started)
-            del classifier
-        except (OSError, RuntimeError, ValueError) as exc:
-            cache.fail("genre", genre_signature, str(exc))
-            warning = f"Genre classifier unavailable; continuing without it: {exc}"
-            event("warning", warning)
-            genre_warnings.append(warning)
-            genre_candidates = []
-            genre_excerpt_candidates = []
-            genre = ""
-    gc.collect()
+    genre_candidates = []
+    genre_excerpt_candidates = []
+    genre = ""
+    if not args.skip_genre:
+        genre_signature = cache_signature(stage="genre", revision=GENRE_REVISION, excerpt_seconds=10, excerpt_count=3)
+        genre_stage = cache.load("genre", genre_signature)
+        if genre_stage is not None:
+            event("cache", "Reusing cached genre evidence")
+            genre_candidates = genre_stage["genre_candidates"]
+            genre_excerpt_candidates = genre_stage.get("genre_excerpt_candidates", [])
+            genre = genre_stage["genre"]
+        else:
+            genre_started = time.monotonic()
+            event("genre", "Suggesting musical genre")
+            try:
+                classifier = pipeline("audio-classification", model=snapshot_download(GENRE_MODEL, revision=GENRE_REVISION, local_files_only=True), device=-1, model_kwargs={"local_files_only": True})
+                genre_rate = int(getattr(classifier.feature_extractor, "sampling_rate", rate))
+                genre_audio = _resample(waveform.astype(np.float32, copy=False), rate, genre_rate)
+                totals = {}
+                genre_excerpt_candidates = []
+                clips = excerpts(genre_audio, genre_rate, seconds=10)
+                with torch.inference_mode():
+                    for clip in clips:
+                        excerpt = []
+                        for item in classifier(clip, top_k=classifier.model.config.num_labels):
+                            label = clean_genre_label(item["label"])
+                            score_value = float(item["score"])
+                            totals[label] = totals.get(label, 0.0) + score_value / max(1, len(clips))
+                            excerpt.append({"label": label, "score": score_value})
+                        genre_excerpt_candidates.append(sorted(excerpt, key=lambda item: item["score"], reverse=True)[:3])
+                genre_candidates = [{"label": label, "score": score_value} for label, score_value in
+                                    sorted(totals.items(), key=lambda item: item[1], reverse=True)[:5]]
+                genre = summarize_genre(genre_candidates, genre_excerpt_candidates)
+                cache.save("genre", genre_signature, {
+                    "genre": genre,
+                    "genre_candidates": genre_candidates,
+                    "genre_excerpt_candidates": genre_excerpt_candidates,
+                    "model": GENRE_MODEL,
+                    "revision": GENRE_REVISION,
+                }, elapsed_seconds=time.monotonic() - genre_started)
+                del classifier
+            except (OSError, RuntimeError, ValueError) as exc:
+                cache.fail("genre", genre_signature, str(exc))
+                warning = f"Genre classifier unavailable; continuing without it: {exc}"
+                event("warning", warning)
+                genre_warnings.append(warning)
+                genre_candidates = []
+                genre_excerpt_candidates = []
+                genre = ""
+        gc.collect()
+
     analysis_warnings = melody_warnings + alignment_warnings + genre_warnings
     if lyrics.strip():
         analysis_warnings.append("Lyric sections are inferred from repeated passages and position; review before generating.")
-    if lyrics_model == "unavailable":
-        analysis_warnings.append("Lyric transcription is unavailable locally. Install the Lyrics component in Settings.")
+    if not args.skip_lyrics and lyrics_model == "unavailable":
+        analysis_warnings.append("Lyric transcription is unavailable locally. Install a Lyrics backend in Settings.")
     if lyrics_model == LEGACY_WHISPER_MODEL:
         analysis_warnings.append("Using Whisper small. Update / Repair Engine in Settings to install Whisper large-v3-turbo.")
     if silent_words:
         analysis_warnings.append(f"Omitted {silent_words} timestamped words in digital silence; raw transcription is retained.")
-    if separation_status == "unavailable":
+    if not args.skip_lyrics and separation_status == "unavailable":
         analysis_warnings.append("Vocal activity detection is unavailable; Whisper used the original mix.")
-    style_signature = cache_signature(stage="style", revision=STYLE_REVISION, excerpt_seconds=10, excerpt_count=3)
-    style_stage = cache.load("style", style_signature)
-    if style_stage is not None:
-        event("cache", "Reusing cached style evidence")
-        descriptors = style_stage.get("descriptors", [])
-    else:
-        style_started = time.monotonic()
-        descriptors = []
-        try:
-            event("style", "Analyzing instrumentation, vocals, mood and production")
-            descriptors = describe_style(_resample(waveform, rate, 48000), 48000)
-            cache.save("style", style_signature, {"descriptors": descriptors, "model": STYLE_MODEL, "revision": STYLE_REVISION}, elapsed_seconds=time.monotonic() - style_started)
-        except (OSError, RuntimeError) as exc:
-            cache.fail("style", style_signature, str(exc))
-            analysis_warnings.append("Detailed style model unavailable locally. Update the cover engine in Settings.")
+    descriptors = []
+    if not args.skip_style:
+        style_signature = cache_signature(stage="style", revision=STYLE_REVISION, excerpt_seconds=10, excerpt_count=3)
+        style_stage = cache.load("style", style_signature)
+        if style_stage is not None:
+            event("cache", "Reusing cached style evidence")
+            descriptors = style_stage.get("descriptors", [])
+        else:
+            style_started = time.monotonic()
+            descriptors = []
+            try:
+                event("style", "Analyzing instrumentation, vocals, mood and production")
+                descriptors = describe_style(_resample(waveform, rate, 48000), 48000)
+                cache.save("style", style_signature, {"descriptors": descriptors, "model": STYLE_MODEL, "revision": STYLE_REVISION}, elapsed_seconds=time.monotonic() - style_started)
+            except (OSError, RuntimeError) as exc:
+                cache.fail("style", style_signature, str(exc))
+                analysis_warnings.append("Detailed style model unavailable locally. Update the cover engine in Settings.")
+        style_parts = [part for part in [genre] + [item["label"] for item in descriptors if item.get("label")] if part]
+        style = ", ".join(style_parts)
+
     style_parts = [part for part in [genre] + [item["label"] for item in descriptors if item.get("label")] if part]
     style = ", ".join(style_parts)
 
@@ -567,6 +596,12 @@ def main() -> int:
         "genre_model": GENRE_MODEL, "genre_revision": GENRE_REVISION,
         "acoustic_structure": acoustic_structure,
         "voice_activity": {"status": separation_status, "windows": vocal_windows or [], "model": SEPARATION_MODEL_NAME, "revision": SEPARATION_REVISION},
+        "enabled_analysis": {
+            "lyrics": not args.skip_lyrics,
+            "genre": not args.skip_genre,
+            "style": not args.skip_style,
+            "vocal_activity": not args.skip_lyrics and not args.disable_separation,
+        },
         "cache_key": cache.source_sha256, "stages": cache.records,
     }
     (args.output / "cover_transcription.json").write_text(json.dumps(analysis, indent=2), encoding="utf-8")

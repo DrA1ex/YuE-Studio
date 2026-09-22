@@ -159,15 +159,20 @@ struct StorageSettingsView: View {
     @StateObject private var storage = StorageSettingsModel()
     @State private var pendingDelete: StorageTarget?
     @State private var pendingComponent: CoverComponent?
+    @AppStorage(CoverAnalysisPreferences.lyricsKey) private var analyzeLyrics = true
+    @AppStorage(CoverAnalysisPreferences.genreKey) private var analyzeGenre = true
+    @AppStorage(CoverAnalysisPreferences.styleKey) private var analyzeStyle = true
+    @AppStorage(CoverAnalysisPreferences.vocalActivityKey) private var analyzeVocalActivity = true
+    @AppStorage(CoverAnalysisPreferences.lyricsBackendKey) private var lyricsBackend = CoverLyricsBackend.automatic.rawValue
 
     var body: some View {
         Form {
             Section("Audio analysis engine") {
                 Text(backend.coverRuntimeReady ? "Installed · ready for analysis" : "Engine installation required")
-                Text("Every component below is optional except Melody and score. The model manager shows what each download is for, its exact model names, and its current disk usage.")
+                Text("Only Melody and score is required. Configure optional analysis stages below; the model manager shows the exact downloads, purpose, and disk usage for each component.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Button("Install recommended components") {
+                Button("Install enabled components") {
                     backend.installCoverRuntime { result in
                         if case .failure(let error) = result { storage.error = error.localizedDescription }
                         storage.refresh()
@@ -177,6 +182,28 @@ struct StorageSettingsView: View {
                     ProgressView()
                     Text(backend.coverStatus).font(.caption)
                 }
+            }
+            Section("Cover analysis") {
+                Text("Melody and score always runs because the ABC melody is required for source-audio covers. Everything below is optional.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("Extract lyrics", isOn: $analyzeLyrics)
+                if analyzeLyrics {
+                    Picker("Lyrics backend", selection: $lyricsBackend) {
+                        ForEach(CoverLyricsBackend.allCases) { backend in
+                            Text(backend.title).tag(backend.rawValue)
+                        }
+                    }
+                    Toggle("Detect vocal regions first", isOn: $analyzeVocalActivity)
+                    Text("Hybrid Demucs is only a preprocessing step for Whisper. Disable it to transcribe the original mix directly.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Toggle("Detect genre", isOn: $analyzeGenre)
+                Toggle("Analyze detailed style", isOn: $analyzeStyle)
+                Text("Genre classification and CLAP style analysis are independent stages; neither is required for lyrics or melody extraction.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Cover model manager") {
                 ForEach(CoverComponent.allCases) { component in

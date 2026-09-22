@@ -269,6 +269,46 @@ final class StudioTests: XCTestCase {
         XCTAssertEqual(Array(cover.suffix(2)), ["--mlx-python", mlx.path])
     }
 
+    @MainActor func testCoverAnalysisArgumentsSkipDisabledStages() {
+        let audio = URL(fileURLWithPath: "/tmp/cover.wav")
+        let output = URL(fileURLWithPath: "/tmp/cover-out")
+        let mlx = URL(fileURLWithPath: "/tmp/whisper/python")
+        let args = Backend.transcriptionArguments(
+            audio: audio,
+            output: output,
+            hum: false,
+            mlxPython: mlx,
+            lyrics: false,
+            genre: false,
+            style: false,
+            vocalActivity: false
+        )
+        XCTAssertTrue(args.contains("--skip-lyrics"))
+        XCTAssertTrue(args.contains("--skip-genre"))
+        XCTAssertTrue(args.contains("--skip-style"))
+        XCTAssertTrue(args.contains("--disable-separation"))
+        XCTAssertFalse(args.contains("--mlx-python"))
+    }
+
+    @MainActor func testCoverAnalysisArgumentsKeepIndependentStages() {
+        let audio = URL(fileURLWithPath: "/tmp/cover.wav")
+        let output = URL(fileURLWithPath: "/tmp/cover-out")
+        let args = Backend.transcriptionArguments(
+            audio: audio,
+            output: output,
+            hum: false,
+            mlxPython: nil,
+            lyrics: false,
+            genre: true,
+            style: true,
+            vocalActivity: true
+        )
+        XCTAssertTrue(args.contains("--skip-lyrics"))
+        XCTAssertFalse(args.contains("--skip-genre"))
+        XCTAssertFalse(args.contains("--skip-style"))
+        XCTAssertTrue(args.contains("--disable-separation"))
+    }
+
     @MainActor func testDiscardHumRemovesOnlyItsRecording() throws {
         let root = try fixture(), recording = root.appendingPathComponent("hum.wav"), other = root.appendingPathComponent("source.wav")
         try writeAudio(recording); try writeAudio(other)
