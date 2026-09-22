@@ -51,6 +51,7 @@ struct Paths {
         env["PYTHONUNBUFFERED"] = "1"; env["TQDM_DISABLE"] = "1"
         env["YUE2_OUTPUT_DIR"] = output.path; env["YUE2_ANE_CACHE"] = aneCache.path
         env["HF_HOME"] = models.path; env["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        if packaged { env["YUE2_MODEL_LOCAL_ONLY"] = "1" }
         env["PYTHONPATH"] = (packaged ? src : repoRoot).appendingPathComponent("src").path
         env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
         return env

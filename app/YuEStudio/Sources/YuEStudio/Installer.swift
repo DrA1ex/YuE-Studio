@@ -20,6 +20,7 @@ final class Installer: ObservableObject {
     private var lastRateLog = Date.distantPast
 
     private var mainModelURL: URL { Paths.models.appendingPathComponent("hub/models--m-a-p--YuE2-3B") }
+    private var vaeModelURL: URL { Paths.models.appendingPathComponent("hub/models--m-a-p--YuE2-Vae") }
 
     static func installationIsUsable(pythonPresent: Bool, modelsPresent: Bool, installedSchema: Int?) -> Bool {
         pythonPresent && modelsPresent && (installedSchema == nil || installedSchema == runtimeSchema)
@@ -56,7 +57,7 @@ final class Installer: ObservableObject {
         let fm = FileManager.default
         let info = installedInfo()
         let pythonPresent = fm.isExecutableFile(atPath: Paths.python.path)
-        let modelsPresent = fm.fileExists(atPath: mainModelURL.path)
+        let modelsPresent = fm.fileExists(atPath: mainModelURL.path) && fm.fileExists(atPath: vaeModelURL.path)
         let schema = info["runtime_schema"] as? Int
         guard Self.installationIsUsable(pythonPresent: pythonPresent, modelsPresent: modelsPresent, installedSchema: schema) else {
             state = .needed; return
@@ -106,28 +107,31 @@ final class Installer: ObservableObject {
                 try await step(2) { try await self.run(uv, ["venv", support.appendingPathComponent("env").path, "--python", "3.12", "--clear"], env) }
                 try await step(3) { try await self.run(uv, ["pip", "install", "--python", Paths.python.path, Paths.src.path + "[apple]"], env) }
                 try await step(4) {
-                    if FileManager.default.fileExists(atPath: self.mainModelURL.path) {
-                        self.detail = "Existing YuE2 model found · reusing downloaded files"
-                        self.append("YuE2 model already downloaded; skipping model download")
-                    } else {
-                        // The download script reports byte progress from the Hub client's own callbacks.
-                        try await self.run(Paths.python.path, [Paths.src.appendingPathComponent("tools/download_models.py").path], env) { [weak self] line in
-                            guard line.hasPrefix("{"), let d = line.data(using: .utf8),
-                                  let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                                  let bytes = o["bytes"] as? Double, let total = o["total"] as? Double, total > 0 else { return }
-                            let rate = o["rate_mbps"] as? Double ?? 0
-                            var remaining = ""
-                            if rate > 1 {
-                                let seconds = max(0, (total - bytes) / (rate * 1e6))
-                                remaining = seconds < 60 ? " · under a minute left" : String(format: " · about %.0f min left", seconds / 60)
-                            }
+                    // The downloader first verifies both pinned snapshots locally. A healthy existing
+                    // installation therefore needs no network; missing or corrupt files are repaired.
+                    try await self.run(Paths.python.path, [Paths.src.appendingPathComponent("tools/download_models.py").path], env) { [weak self] line in
+                        guard line.hasPrefix("{"), let d = line.data(using: .utf8),
+                              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return }
+                        if o["cached"] as? Bool == true {
                             Task { @MainActor in
-                                guard let self else { return }
-                                self.progress = min(0.99, bytes / total)
-                                self.detail = String(format: "%.2f of %.1f GB · %.0f MB/s%@", bytes / 1e9, total / 1e9, rate, remaining)
-                                if Date().timeIntervalSince(self.lastRateLog) > 15 && bytes > 0 {
-                                    self.lastRateLog = Date(); self.append(String(format: "Downloaded %.2f GB at %.0f MB/s", bytes / 1e9, rate))
-                                }
+                                self?.detail = "Existing pinned models verified · no download needed"
+                                self?.append("YuE2 and VAE model snapshots verified")
+                            }
+                            return
+                        }
+                        guard let bytes = o["bytes"] as? Double, let total = o["total"] as? Double, total > 0 else { return }
+                        let rate = o["rate_mbps"] as? Double ?? 0
+                        var remaining = ""
+                        if rate > 1 {
+                            let seconds = max(0, (total - bytes) / (rate * 1e6))
+                            remaining = seconds < 60 ? " · under a minute left" : String(format: " · about %.0f min left", seconds / 60)
+                        }
+                        Task { @MainActor in
+                            guard let self else { return }
+                            self.progress = min(0.99, bytes / total)
+                            self.detail = String(format: "%.2f of %.1f GB · %.0f MB/s%@", bytes / 1e9, total / 1e9, rate, remaining)
+                            if Date().timeIntervalSince(self.lastRateLog) > 15 && bytes > 0 {
+                                self.lastRateLog = Date(); self.append(String(format: "Downloaded %.2f GB at %.0f MB/s", bytes / 1e9, rate))
                             }
                         }
                     }

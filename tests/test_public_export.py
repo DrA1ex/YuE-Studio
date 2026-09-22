@@ -8,7 +8,8 @@ from transformers import AutoModelForCausalLM
 
 from yue2.modeling_yue2 import YuE2Config, YuE2ForCausalLM
 from yue2.modeling_vae import YuE2VAEConfig
-from yue2.storage import copy_model_files, resolve_model
+from yue2.storage import copy_model_files, resolve_model, verify_model_snapshot
+from yue2.models import MAIN_MODEL_ID, MAIN_MODEL_REVISION, VAE_MODEL_ID, VAE_MODEL_REVISION
 from test_model import tiny_config
 
 
@@ -73,3 +74,57 @@ def test_hf_download_is_restricted_to_inference_files(monkeypatch, tmp_path):
     assert '*.json' not in captured['allow_patterns'] and '*.py' not in captured['allow_patterns']
     assert 'config.json' in captured['allow_patterns']
     assert captured['revision'] == 'a' * 40 and captured['local_files_only']
+
+
+def test_default_pipeline_pins_first_party_model_revisions(monkeypatch, tmp_path):
+    from yue2.pipeline import YuE2Pipeline
+    calls = []
+
+    def resolve(model, revision=None, **kwargs):
+        calls.append((str(model), revision, kwargs.get("local_files_only")))
+        return tmp_path
+
+    class ProbePipeline(YuE2Pipeline):
+        def __init__(self, model_dir, vae_dir, **kwargs):
+            self.load_timing = {}
+
+    monkeypatch.setattr("yue2.pipeline.resolve_model", resolve)
+    ProbePipeline.from_pretrained(local_files_only=True, progress=False)
+    assert calls == [(MAIN_MODEL_ID, MAIN_MODEL_REVISION, True),
+                     (VAE_MODEL_ID, VAE_MODEL_REVISION, True)]
+
+
+def test_resolve_model_forwards_repair_download_options(monkeypatch, tmp_path):
+    import huggingface_hub
+    captured = {}
+
+    def download(*args, **kwargs):
+        captured.update(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    resolve_model("example/YuE2", force_download=True, max_workers=3)
+    assert captured["force_download"] is True and captured["max_workers"] == 3
+
+
+
+def test_verify_model_snapshot_rejects_missing_indexed_shard(tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {"a": "model-00001-of-00002.safetensors",
+                       "b": "model-00002-of-00002.safetensors"}
+    }))
+    (tmp_path / "model-00001-of-00002.safetensors").write_bytes(b"partial")
+    with pytest.raises(FileNotFoundError, match="Missing model shard"):
+        verify_model_snapshot(tmp_path)
+
+
+def test_verify_model_snapshot_accepts_complete_indexed_shards(tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {"a": "model-00001-of-00002.safetensors",
+                       "b": "model-00002-of-00002.safetensors"}
+    }))
+    (tmp_path / "model-00001-of-00002.safetensors").write_bytes(b"a")
+    (tmp_path / "model-00002-of-00002.safetensors").write_bytes(b"b")
+    assert verify_model_snapshot(tmp_path) == tmp_path
