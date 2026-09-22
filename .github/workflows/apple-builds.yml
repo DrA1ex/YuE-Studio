@@ -2,26 +2,9 @@ name: Apple builds
 
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - ".github/workflows/apple-builds.yml"
-      - "app/**"
-      - "icons/**"
-      - "src/**"
-      - "tools/**"
-      - "skills/**"
-      - "pyproject.toml"
   push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/apple-builds.yml"
-      - "app/**"
-      - "icons/**"
-      - "src/**"
-      - "tools/**"
-      - "skills/**"
-      - "pyproject.toml"
+    tags:
+      - "*"
 
 permissions:
   contents: read
