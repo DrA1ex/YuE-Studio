@@ -3,10 +3,27 @@ import AVFoundation
 
 @MainActor
 extension Backend {
-    static func transcriptionArguments(audio: URL, output: URL, hum: Bool, mlxPython: URL?) -> [String] {
-        var args = ["-u", Paths.transcriber.path, audio.path, "--output", output.path, "--cache-dir", Paths.coverAnalyses.path, "--device", "cpu", "--dtype", "fp32"]
-        if hum { args.append("--hum") }
-        else if let mlxPython { args += ["--mlx-python", mlxPython.path] }
+    static func transcriptionArguments(
+        audio: URL,
+        output: URL,
+        hum: Bool,
+        mlxPython: URL?,
+        lyrics: Bool = true,
+        genre: Bool = true,
+        style: Bool = true,
+        vocalActivity: Bool = true
+    ) -> [String] {
+        var args = ["-u", Paths.transcriber.path, audio.path, "--output", output.path,
+                    "--cache-dir", Paths.coverAnalyses.path, "--device", "cpu", "--dtype", "fp32"]
+        if hum {
+            args.append("--hum")
+            return args
+        }
+        if !lyrics { args.append("--skip-lyrics") }
+        if !genre { args.append("--skip-genre") }
+        if !style { args.append("--skip-style") }
+        if !vocalActivity || !lyrics { args.append("--disable-separation") }
+        if lyrics, let mlxPython { args += ["--mlx-python", mlxPython.path] }
         return args
     }
 
@@ -51,9 +68,24 @@ extension Backend {
                 coverStatus = "Decoding source audio…"
                 try await Task.detached(priority: .userInitiated) { try AudioPreparation.writeAnalysisAudio(source: URL(fileURLWithPath: source.path), destination: normalized) }.value
                 try Task.checkCancellation()
-                coverStatus = "Analyzing melody, lyrics and genre…"
-                let arguments = Self.transcriptionArguments(audio: normalized, output: output, hum: hum,
-                    mlxPython: FileManager.default.isExecutableFile(atPath: Paths.coverWhisperPython.path) ? Paths.coverWhisperPython : nil)
+                let lyrics = hum ? false : CoverAnalysisPreferences.lyricsEnabled
+                let genre = hum ? false : CoverAnalysisPreferences.genreEnabled
+                let style = hum ? false : CoverAnalysisPreferences.styleEnabled
+                let vocalActivity = hum ? false : CoverAnalysisPreferences.vocalActivityEnabled
+                let lyricsBackend = CoverAnalysisPreferences.lyricsBackend
+                let useMLX = lyrics && lyricsBackend != .transformers &&
+                    FileManager.default.isExecutableFile(atPath: Paths.coverWhisperPython.path)
+                coverStatus = hum ? "Transcribing melody…" : "Analyzing enabled cover stages…"
+                let arguments = Self.transcriptionArguments(
+                    audio: normalized,
+                    output: output,
+                    hum: hum,
+                    mlxPython: useMLX ? Paths.coverWhisperPython : nil,
+                    lyrics: lyrics,
+                    genre: genre,
+                    style: style,
+                    vocalActivity: vocalActivity
+                )
                 try await runCoverCommand(Paths.coverPython.path, arguments)
                 try Task.checkCancellation()
                 let score = try String(contentsOf: output.appendingPathComponent("score.abc"), encoding: .utf8)
@@ -88,27 +120,28 @@ extension Backend {
         }
     }
 
-    /// Install the complete recommended core while keeping MLX and vocal
-    /// activity optional. The per-component entry point below is used by the
-    /// Settings panel when the user wants a smaller installation.
+    /// Install only the components required by the enabled cover-analysis stages.
     func installCoverRuntime(completion: @escaping (Result<Void, Error>) -> Void) {
-        let core: [CoverComponent] = [.melody, .lyrics, .genre, .style]
-        let optional: [CoverComponent] = [.mlxWhisper, .vocalActivity]
+        var components: [CoverComponent] = [.melody]
+        if CoverAnalysisPreferences.lyricsEnabled {
+            switch CoverAnalysisPreferences.lyricsBackend {
+            case .automatic, .mlx:
+                components.append(.mlxWhisper)
+            case .transformers:
+                components.append(.lyrics)
+            }
+            if CoverAnalysisPreferences.vocalActivityEnabled { components.append(.vocalActivity) }
+        }
+        if CoverAnalysisPreferences.genreEnabled { components.append(.genre) }
+        if CoverAnalysisPreferences.styleEnabled { components.append(.style) }
+
         startCoverInstallation(completion: completion) {
             let uv = try self.coverUV()
-            for component in core {
+            for component in components {
                 try await self.installCoverComponentProcess(component, uv: uv)
                 try self.markCoverComponentInstalled(component)
             }
-            for component in optional {
-                do {
-                    try await self.installCoverComponentProcess(component, uv: uv)
-                    try self.markCoverComponentInstalled(component)
-                } catch {
-                    self.append("\(component.title) unavailable; analysis fallback remains active: \(error.localizedDescription)")
-                }
-            }
-            self.append("Recommended cover components installed")
+            self.append("Enabled cover components installed")
         }
     }
 
