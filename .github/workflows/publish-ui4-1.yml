@@ -1,0 +1,144 @@
+name: Publish YuE Studio UI 0.4.0-ui.4-1
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - docs/release-notes/v0.4.0-ui.4-1.md
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    name: Build DMG
+    runs-on: macos-26
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          test -n "$XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          test "$(uname -m)" = "arm64"
+
+      - name: Install uv
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install uv
+          UV_BIN="$(command -v uv)"
+          test -x "$UV_BIN"
+          echo "UV=$UV_BIN" >> "$GITHUB_ENV"
+
+      - name: Build disk image
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+          bash app/package.sh
+          test -f releases/YuE-Studio.dmg
+          codesign --verify --deep --strict "releases/YuE Studio.app"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: YuE-Studio-DMG
+          path: releases/YuE-Studio.dmg
+          if-no-files-found: error
+
+  ipa:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          test -n "$XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          test "$(uname -m)" = "arm64"
+
+      - name: Build YuE Remote
+        shell: bash
+        run: |
+          set -euo pipefail
+          DERIVED="$RUNNER_TEMP/YuERemoteDerived"
+          xcodebuild \
+            -project app/YuERemote/YuERemote.xcodeproj \
+            -scheme YuERemote \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$DERIVED" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+          APP="$DERIVED/Build/Products/Release-iphoneos/YuERemote.app"
+          test -d "$APP"
+          lipo -archs "$APP/YuERemote" | grep -qw arm64
+
+          mkdir -p build/ipa/Payload
+          ditto "$APP" build/ipa/Payload/YuERemote.app
+          (
+            cd build/ipa
+            zip -qry ../YuE-Remote-unsigned.ipa Payload
+          )
+          unzip -t build/YuE-Remote-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: YuE-Remote-IPA
+          path: build/YuE-Remote-unsigned.ipa
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [dmg, ipa]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: YuE-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum YuE-Studio.dmg YuE-Remote-unsigned.ipa > SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create v0.4.0-ui.4-1 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "YuE Studio UI 0.4.0-ui.4-1 — first DrA1ex fork release" \
+            --notes-file docs/release-notes/v0.4.0-ui.4-1.md \
+            release-assets/YuE-Studio.dmg \
+            release-assets/YuE-Remote-unsigned.ipa \
+            release-assets/SHA256SUMS.txt
