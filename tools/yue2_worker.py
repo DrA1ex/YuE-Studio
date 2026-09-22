@@ -93,7 +93,9 @@ def pipeline():
         lean = device == "mps" and os.environ.get("YUE2_LEAN", "1") != "0"
         # The VAE decodes in tiles; smaller tiles halve its activation peak (about 3.6 GB at 1024
         # frames) on machines where the whole memory is shared with the model.
+        local_only = os.environ.get("YUE2_MODEL_LOCAL_ONLY", "0") != "0"
         PIPE = YuE2Pipeline.from_pretrained("m-a-p/YuE2-3B", device=device, progress=False, lean=lean,
+                                            local_files_only=local_only,
                                             vae_core_frames=1024 if PHYSICAL_GIB >= 24 else 512)
         log(f"Physical memory {PHYSICAL_GIB:.0f} GB: {'lean' if lean else 'full'} model, VAE tile {PIPE.vae_core_frames} frames, "
             f"token batches of up to {MAX_BATCH} on {'MLX with 8-bit weights' if token_engine() == 'mlx' else 'PyTorch'}, "
@@ -488,8 +490,9 @@ SCHED = Scheduler()
 
 # ── Workers (one thread each, started by the scheduler) ───────────────────────
 
-def fail(song, exc):
-    traceback.print_exc(file=sys.stderr)
+def fail(song, exc, *, show_traceback=True):
+    if show_traceback:
+        traceback.print_exc(file=sys.stderr)
     log(f"{song.label} failed: {type(exc).__name__}: {exc}")
     emit(event="failed", path=song.path, message=f"{type(exc).__name__}: {exc}")
     SCHED.finish(song, FAILED, str(exc)[:200])
@@ -518,6 +521,7 @@ def run_batch(batch):
     from yue2.pipeline import SymbolicPlan
     from yue2.protocol import CODEC_OFFSET, token_prefixes
     songs = list(batch)
+    model = None
     try:
         pipe, model = acquire_model()
         # The GPU is ours now: take along any songs of the same kind that queued meanwhile (a job
@@ -625,16 +629,18 @@ def run_batch(batch):
             if s.state in (PLANNING, TOKENIZING):
                 SCHED.finish(s, CANCELLED, "stopped")
     except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
         for s in songs:
             if s.state in (PLANNING, TOKENIZING):
-                fail(s, exc)
+                fail(s, exc, show_traceback=False)
     finally:
         with SCHED.cv:
             SCHED.token_batch = None
-        try:
-            trim_gpu_memory(model, "batch finished")
-        except Exception:
-            pass
+        if model is not None:
+            try:
+                trim_gpu_memory(model, "batch finished")
+            except Exception as exc:
+                log(f"Could not trim batch GPU memory: {type(exc).__name__}: {exc}")
         SCHED.tick()
 
 

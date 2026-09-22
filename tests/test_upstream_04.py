@@ -62,7 +62,7 @@ def test_concurrent_runs_have_unique_directories(tmp_path):
     (4094, True, False, True), (4095, True, False, False),
     (100, False, False, False), (100, True, True, False)])
 def test_remote_capacity_and_engine_opt_out(tmp_path, frames, allow, failed, expected):
-    s = song(tmp_path, frames, allow); s.remote_failed = failed
+    s = song(tmp_path, frames, allow); s.remote_failed = failed; s.remote_assigned = True
     with patch.object(worker, 'REMOTE', object()):
         assert worker.remote_can_take(s) is expected
 
@@ -70,19 +70,21 @@ def test_remote_capacity_and_engine_opt_out(tmp_path, frames, allow, failed, exp
 def test_scheduler_uses_mac_and_phone_for_different_songs(tmp_path):
     a, b = song(tmp_path / 'a'), song(tmp_path / 'b')
     a.wants_ane = b.wants_ane = True
-    scheduler = worker.Scheduler(); scheduler.songs = [a, b]
-    with patch.object(worker, 'REMOTE', object()), patch.object(worker, 'CONCURRENT', True):
+    scheduler = worker.Scheduler()
+    with patch.object(worker, 'REMOTE', object()), patch.object(worker, 'CONCURRENT', True), \
+         patch.object(scheduler, 'tick'):
+        scheduler.submit([a, b])
         starts = scheduler.schedule()
     assert starts == [(worker.run_ane, a), (worker.run_remote, b)]
     assert scheduler.ane_synth is a and scheduler.remote_synth is b
 
 
-def test_scheduler_moves_running_gpu_song_to_phone(tmp_path):
+def test_scheduler_keeps_running_gpu_song_on_mac(tmp_path):
     s = song(tmp_path); s.state = worker.SYNTHING
     scheduler = worker.Scheduler(); scheduler.songs = [s]; scheduler.gpu_synth = s
     with patch.object(worker, 'REMOTE', object()), patch.object(worker, 'CONCURRENT', True):
         assert scheduler.schedule() == []
-    assert s.migrate == 'remote' and scheduler.remote_synth is s
+    assert s.migrate is None and scheduler.remote_synth is None
 
 
 def test_remote_failure_returns_song_to_mac(tmp_path):
@@ -205,3 +207,33 @@ def test_phone_refusal_after_gpu_migration_requeues_locally(tmp_path):
     assert scheduler.remote_synth is None and scheduler.gpu_synth is None
     with patch.object(worker, 'REMOTE', object()):
         assert not worker.remote_can_take(s)
+
+
+def test_worker_packaged_mode_never_resolves_models_online():
+    import yue2
+    stub = SimpleNamespace(vae_core_frames=1024, _model=object())
+    stub._load_model = lambda: None
+    previous = worker.PIPE
+    try:
+        worker.PIPE = None
+        with patch.dict(worker.os.environ, {"YUE2_MODEL_LOCAL_ONLY": "1"}), \
+             patch.object(worker, "AR_ENGINE", "torch"), \
+             patch.object(yue2.YuE2Pipeline, "from_pretrained", return_value=stub) as load:
+            worker.pipeline()
+        assert load.call_args.kwargs["local_files_only"] is True
+    finally:
+        worker.PIPE = previous
+
+
+def test_batch_load_failure_prints_one_traceback_and_skips_unbound_cleanup(tmp_path):
+    songs = [song(tmp_path / "a"), song(tmp_path / "b")]
+    for value in songs:
+        value.state = worker.PLANNING
+    with patch.object(worker, "acquire_model", side_effect=RuntimeError("offline model missing")), \
+         patch.object(worker.traceback, "print_exc") as trace, \
+         patch.object(worker, "log"), patch.object(worker, "emit"), \
+         patch.object(worker.SCHED, "finish"), patch.object(worker.SCHED, "tick"), \
+         patch.object(worker, "trim_gpu_memory") as trim:
+        worker.run_batch(songs)
+    assert trace.call_count == 1
+    trim.assert_not_called()

@@ -11,6 +11,7 @@ import torch
 
 from .protocol import SongRequest, GenerationConfig, Sampling, token_prefixes, negative_prefix, CODEC_OFFSET, resolve_sampling
 from .storage import resolve_model, model_identity, identity, write_json, collect_hashes, sha256_file, copy_model_files
+from .models import MAIN_MODEL_ID, MAIN_MODEL_REVISION, VAE_MODEL_ID, VAE_MODEL_REVISION
 from .tokenization_yue2 import YuE2TextTokenizer
 from .sampling import generate_tokens, synchronize
 from .progress import Progress
@@ -177,7 +178,7 @@ class YuE2Pipeline:
             torch.cuda.set_per_process_memory_fraction(min(budget / total, 1), self.device)
 
     @classmethod
-    def from_pretrained(cls, model="m-a-p/YuE2-3B", *, vae="m-a-p/YuE2-Vae",
+    def from_pretrained(cls, model=MAIN_MODEL_ID, *, vae=VAE_MODEL_ID,
                         revision=None, vae_revision=None, local_files_only=False,
                         token=None, cache_dir=None, progress=True, **kwargs):
         """Load a song pipeline with English progress on stderr; set progress=False to hide it."""
@@ -189,9 +190,13 @@ class YuE2Pipeline:
             metadata = json.loads(saved.read_text())
             parent = Path(model)
             model = parent / metadata["model"]
-            if vae == "m-a-p/YuE2-Vae":
+            if vae == VAE_MODEL_ID:
                 vae = parent / metadata["vae"]
             kwargs.setdefault("generation_config", GenerationConfig.from_dict(metadata["generation_config"]))
+        if revision is None and str(model) == MAIN_MODEL_ID:
+            revision = MAIN_MODEL_REVISION
+        if vae_revision is None and str(vae) == VAE_MODEL_ID:
+            vae_revision = VAE_MODEL_REVISION
         hub = dict(local_files_only=local_files_only, token=token, cache_dir=cache_dir)
         with Progress(enabled=progress).stage("Resolving model files"):
             model_path = resolve_model(model, revision=revision, **hub)

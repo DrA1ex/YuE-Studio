@@ -51,7 +51,7 @@ def resolve_model(model, revision=None, local_files_only=False, token=None, cach
                                   token=token, cache_dir=cache_dir,
                                   allow_patterns=sorted(MODEL_FILES) +
                                       ["model-?????-of-?????.safetensors"] +
-                                      ["licenses/" + name for name in sorted(MODEL_LICENSES)]))
+                                      ["licenses/" + name for name in sorted(MODEL_LICENSES)], **kwargs))
 
 
 def copy_model_files(source, destination):
@@ -102,8 +102,38 @@ def copy_model_files(source, destination):
     write_json(destination / "weights_manifest.json", {"files": weights["files"]})
 
 
-def model_identity(path, verify=True):
+def verify_model_snapshot(path):
+    """Validate that a cached Hugging Face snapshot has a complete config and weight set."""
     path = Path(path)
+    config = path / "config.json"
+    if not config.is_file():
+        raise FileNotFoundError(f"Missing model config in {path}")
+    json.loads(config.read_text())
+
+    index = path / "model.safetensors.index.json"
+    if index.is_file():
+        value = json.loads(index.read_text())
+        expected = set(value.get("weight_map", {}).values())
+        if not expected:
+            raise ValueError("Model weight index is empty")
+        missing = sorted(name for name in expected if not (path / name).is_file())
+        if missing:
+            raise FileNotFoundError(f"Missing model shard: {missing[0]}")
+    else:
+        files = sorted(path.glob("*.safetensors"))
+        if not files:
+            raise FileNotFoundError(f"No safetensors weights in {path}")
+        if len(files) > 1:
+            shard_names = [file.name for file in files if SHARD_NAME.fullmatch(file.name)]
+            if shard_names:
+                totals = {int(name.split("-of-")[1].split(".")[0]) for name in shard_names}
+                if len(totals) != 1 or len(shard_names) != next(iter(totals)):
+                    raise FileNotFoundError("Model shard set is incomplete")
+    return path
+
+
+def model_identity(path, verify=True):
+    path = verify_model_snapshot(path)
     manifest = path / "weights_manifest.json"
     expected = json.loads(manifest.read_text()) if manifest.exists() else None
     files = sorted(path.glob("*.safetensors"))
