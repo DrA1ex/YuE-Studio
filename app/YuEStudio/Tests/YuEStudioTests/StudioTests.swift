@@ -135,6 +135,21 @@ final class StudioTests: XCTestCase {
                                                        installedSchema: Installer.runtimeSchema + 1, versionCurrent: true))
     }
 
+    @MainActor func testInstallerReusesCompatibleRuntimeAcrossAppVersions() {
+        XCTAssertTrue(Installer.runtimeCanBeReused(pythonPresent: true, modelsPresent: true, ffmpegPresent: true,
+                                                   installedSchema: Installer.runtimeSchema))
+        XCTAssertTrue(Installer.runtimeCanBeReused(pythonPresent: true, modelsPresent: true, ffmpegPresent: true,
+                                                   installedSchema: nil))
+        XCTAssertFalse(Installer.runtimeCanBeReused(pythonPresent: true, modelsPresent: true, ffmpegPresent: true,
+                                                    installedSchema: Installer.runtimeSchema + 1))
+        XCTAssertFalse(Installer.runtimeCanBeReused(pythonPresent: false, modelsPresent: true, ffmpegPresent: true,
+                                                    installedSchema: Installer.runtimeSchema))
+        XCTAssertFalse(Installer.runtimeCanBeReused(pythonPresent: true, modelsPresent: false, ffmpegPresent: true,
+                                                    installedSchema: Installer.runtimeSchema))
+        XCTAssertFalse(Installer.runtimeCanBeReused(pythonPresent: true, modelsPresent: true, ffmpegPresent: false,
+                                                    installedSchema: Installer.runtimeSchema))
+    }
+
     func testAudioTranscoderUsesStableInternalWAVAndHighQualityMP3() {
         let input = URL(fileURLWithPath: "/tmp/input.m4a")
         let wav = URL(fileURLWithPath: "/tmp/output.wav")
