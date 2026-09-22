@@ -29,11 +29,13 @@ extension NWConnection {
     func receiveExactly(_ n: Int) async throws -> Data {
         var out = Data(capacity: n)
         while out.count < n {
-            let want = min(4 << 20, n - out.count)
+            let maximum = min(4 << 20, n - out.count)
+            let minimum = min(64 << 10, maximum)
             let chunk: Data = try await withCheckedThrowingContinuation { cont in
-                receive(minimumIncompleteLength: want, maximumLength: want) { data, _, complete, error in
+                receive(minimumIncompleteLength: minimum, maximumLength: maximum) { data, _, complete, error in
                     if let error { cont.resume(throwing: error); return }
-                    if let data, data.count == want { cont.resume(returning: data); return }
+                    if let data, !data.isEmpty { cont.resume(returning: data); return }
+                    if complete { cont.resume(throwing: WireError.closed); return }
                     cont.resume(throwing: WireError.closed)
                 }
             }

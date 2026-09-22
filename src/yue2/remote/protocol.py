@@ -25,11 +25,29 @@ class Connection:
         except OSError:
             pass
 
-    def send(self, header, payload=b""):
+    def _send_prefix(self, header, payload_len):
         blob = json.dumps(header).encode()
-        self.sock.sendall(struct.pack(">I", len(blob)) + blob + struct.pack(">Q", len(payload)))
+        self.sock.sendall(struct.pack(">I", len(blob)) + blob + struct.pack(">Q", payload_len))
+
+    def send(self, header, payload=b""):
+        self._send_prefix(header, len(payload))
         if len(payload):
             self.sock.sendall(payload)
+
+    def send_parts(self, header, parts):
+        """Send one payload from contiguous buffers without joining them into another large bytes object."""
+        views = []
+        for part in parts:
+            view = memoryview(part)
+            if not view.contiguous:
+                raise ValueError("payload parts must be contiguous")
+            if view.itemsize != 1 or view.format != "B":
+                view = view.cast("B")
+            views.append(view)
+        self._send_prefix(header, sum(view.nbytes for view in views))
+        for view in views:
+            if view.nbytes:
+                self.sock.sendall(view)
 
     def _recv_exactly(self, n):
         buf = bytearray(n)
@@ -49,9 +67,7 @@ class Connection:
         payload = self._recv_exactly(pl) if pl else b""
         return header, payload
 
-    def call(self, op, payload=b"", on_progress=None, **fields):
-        """Send one request and wait for its reply, relaying progress frames."""
-        self.send(dict(fields, op=op), payload)
+    def _recv_reply(self, op, on_progress):
         while True:
             header, data = self.recv()
             if header.get("op") == "progress":
@@ -63,3 +79,13 @@ class Connection:
             if not header.get("ok"):
                 raise RemoteError(header.get("error", f"{op} failed on the iPhone"))
             return header, data
+
+    def call(self, op, payload=b"", on_progress=None, **fields):
+        """Send one request and wait for its reply, relaying progress frames."""
+        self.send(dict(fields, op=op), payload)
+        return self._recv_reply(op, on_progress)
+
+    def call_parts(self, op, parts, on_progress=None, **fields):
+        """Like call(), but stream a payload assembled from existing contiguous buffers."""
+        self.send_parts(dict(fields, op=op), parts)
+        return self._recv_reply(op, on_progress)
