@@ -68,12 +68,12 @@ extension Backend {
                 coverStatus = "Decoding source audio…"
                 try await Task.detached(priority: .userInitiated) { try AudioPreparation.writeAnalysisAudio(source: URL(fileURLWithPath: source.path), destination: normalized) }.value
                 try Task.checkCancellation()
-                let lyrics = hum ? false : CoverAnalysisPreferences.lyricsEnabled
-                let genre = hum ? false : CoverAnalysisPreferences.genreEnabled
-                let style = hum ? false : CoverAnalysisPreferences.styleEnabled
-                let vocalActivity = hum ? false : CoverAnalysisPreferences.vocalActivityEnabled
+                let analyzeLyrics = hum ? false : CoverAnalysisPreferences.lyricsEnabled
+                let analyzeGenre = hum ? false : CoverAnalysisPreferences.genreEnabled
+                let analyzeStyle = hum ? false : CoverAnalysisPreferences.styleEnabled
+                let analyzeVocalActivity = hum ? false : CoverAnalysisPreferences.vocalActivityEnabled
                 let lyricsBackend = CoverAnalysisPreferences.lyricsBackend
-                let useMLX = lyrics && lyricsBackend != .transformers &&
+                let useMLX = analyzeLyrics && lyricsBackend != .transformers &&
                     FileManager.default.isExecutableFile(atPath: Paths.coverWhisperPython.path)
                 coverStatus = hum ? "Transcribing melody…" : "Analyzing enabled cover stages…"
                 let arguments = Self.transcriptionArguments(
@@ -81,10 +81,10 @@ extension Backend {
                     output: output,
                     hum: hum,
                     mlxPython: useMLX ? Paths.coverWhisperPython : nil,
-                    lyrics: lyrics,
-                    genre: genre,
-                    style: style,
-                    vocalActivity: vocalActivity
+                    lyrics: analyzeLyrics,
+                    genre: analyzeGenre,
+                    style: analyzeStyle,
+                    vocalActivity: analyzeVocalActivity
                 )
                 try await runCoverCommand(Paths.coverPython.path, arguments)
                 try Task.checkCancellation()
