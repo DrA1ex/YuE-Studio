@@ -1,0 +1,134 @@
+name: Apple builds
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/apple-builds.yml"
+      - "app/**"
+      - "icons/**"
+      - "src/**"
+      - "tools/**"
+      - "skills/**"
+      - "pyproject.toml"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/apple-builds.yml"
+      - "app/**"
+      - "icons/**"
+      - "src/**"
+      - "tools/**"
+      - "skills/**"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-builds-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dmg:
+    name: Build DMG
+    runs-on: macos-26
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          test -n "$XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          test "$(uname -m)" = "arm64"
+
+      - name: Install uv
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install uv
+          UV_BIN="$(command -v uv)"
+          test -x "$UV_BIN"
+          echo "UV=$UV_BIN" >> "$GITHUB_ENV"
+
+      - name: Build disk image
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+          bash app/package.sh
+          test -f releases/YuE-Studio.dmg
+          codesign --verify --deep --strict "releases/YuE Studio.app"
+          shasum -a 256 releases/YuE-Studio.dmg > releases/YuE-Studio.dmg.sha256
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: YuE-Studio-DMG
+          path: |
+            releases/YuE-Studio.dmg
+            releases/YuE-Studio.dmg.sha256
+          if-no-files-found: error
+
+  ipa:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          test -n "$XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          test "$(uname -m)" = "arm64"
+
+      - name: Build YuE Remote
+        shell: bash
+        run: |
+          set -euo pipefail
+          DERIVED="$RUNNER_TEMP/YuERemoteDerived"
+          xcodebuild \
+            -project app/YuERemote/YuERemote.xcodeproj \
+            -scheme YuERemote \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$DERIVED" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+          APP="$DERIVED/Build/Products/Release-iphoneos/YuERemote.app"
+          test -d "$APP"
+          file "$APP/YuERemote"
+          lipo -archs "$APP/YuERemote" | grep -qw arm64
+
+          mkdir -p build/ipa/Payload
+          ditto "$APP" build/ipa/Payload/YuERemote.app
+          (
+            cd build/ipa
+            zip -qry ../YuE-Remote-unsigned.ipa Payload
+          )
+          unzip -t build/YuE-Remote-unsigned.ipa
+          shasum -a 256 build/YuE-Remote-unsigned.ipa > build/YuE-Remote-unsigned.ipa.sha256
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: YuE-Remote-IPA
+          path: |
+            build/YuE-Remote-unsigned.ipa
+            build/YuE-Remote-unsigned.ipa.sha256
+          if-no-files-found: error
