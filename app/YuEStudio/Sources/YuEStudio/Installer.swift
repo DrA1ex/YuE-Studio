@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class Installer: ObservableObject {
+    // Bump this when an app update requires rebuilding the Python runtime or reinstalling dependencies.
     static let runtimeSchema = 1
     enum State: Equatable { case checking, needed, running, ready, failed(String) }
     struct Step: Identifiable { let id: Int; let title: String; var done = false }
@@ -23,10 +24,17 @@ final class Installer: ObservableObject {
     private var mainModelURL: URL { Paths.models.appendingPathComponent("hub/models--m-a-p--YuE2-3B") }
     private var vaeModelURL: URL { Paths.models.appendingPathComponent("hub/models--m-a-p--YuE2-Vae") }
 
+    static func runtimeCanBeReused(pythonPresent: Bool, modelsPresent: Bool, ffmpegPresent: Bool,
+                                   installedSchema: Int?) -> Bool {
+        pythonPresent && modelsPresent && ffmpegPresent
+            && (installedSchema == nil || installedSchema == runtimeSchema)
+    }
+
     static func installationIsUsable(pythonPresent: Bool, modelsPresent: Bool, ffmpegPresent: Bool,
                                      installedSchema: Int?, versionCurrent: Bool) -> Bool {
-        pythonPresent && modelsPresent && ffmpegPresent && versionCurrent
-            && (installedSchema == nil || installedSchema == runtimeSchema)
+        runtimeCanBeReused(pythonPresent: pythonPresent, modelsPresent: modelsPresent,
+                           ffmpegPresent: ffmpegPresent, installedSchema: installedSchema)
+            && versionCurrent
     }
 
     private func installedInfo() -> [String: Any] {
@@ -63,13 +71,27 @@ final class Installer: ObservableObject {
         let modelsPresent = fm.fileExists(atPath: mainModelURL.path) && fm.fileExists(atPath: vaeModelURL.path)
         let schema = info["runtime_schema"] as? Int
         let versionCurrent = info["version"] as? String == Paths.bundledVersion
-        guard Self.installationIsUsable(pythonPresent: pythonPresent, modelsPresent: modelsPresent,
-                                        ffmpegPresent: Paths.ffmpeg != nil, installedSchema: schema,
-                                        versionCurrent: versionCurrent) else {
+        guard Self.runtimeCanBeReused(pythonPresent: pythonPresent, modelsPresent: modelsPresent,
+                                      ffmpegPresent: Paths.ffmpeg != nil, installedSchema: schema) else {
             state = .needed
             return
         }
-        state = .ready
+        guard !versionCurrent else {
+            state = .ready
+            return
+        }
+
+        // A normal app update changes the bundled source version, not the installed runtime.
+        // Refresh only local source files so startup never needs Python/package/model network checks.
+        do {
+            try refreshBundledSource()
+            try writeInstalledMarker()
+            append("Updated bundled source; existing runtime and models reused")
+            state = .ready
+        } catch {
+            append("Could not refresh bundled source: \(error.localizedDescription)")
+            state = .needed
+        }
     }
 
     func append(_ message: String) {
