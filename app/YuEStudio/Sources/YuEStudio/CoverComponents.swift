@@ -36,6 +36,40 @@ enum CoverComponent: String, CaseIterable, Identifiable, Hashable {
         }
     }
 
+    var models: [String] {
+        switch self {
+        case .melody:
+            ["m-a-p/SheetSage2", "m-a-p/MERT-v2-FullSong"]
+        case .lyrics:
+            ["openai/whisper-large-v3-turbo", "openai/whisper-small (legacy, if present)"]
+        case .genre:
+            ["dima806/music_genres_classification"]
+        case .style:
+            ["laion/clap-htsat-unfused"]
+        case .mlxWhisper:
+            ["mlx-community/whisper-large-v3-turbo"]
+        case .vocalActivity:
+            ["torchaudio Hybrid Demucs · HDEMUCS_HIGH_MUSDB"]
+        }
+    }
+
+    var relationship: String {
+        switch self {
+        case .melody:
+            "SheetSage2 and MERT2 are used together; both are required for source-audio covers."
+        case .lyrics:
+            "CPU/Transformers lyrics backend. This is an alternative to MLX Whisper, not an additional requirement."
+        case .genre:
+            "Independent optional stage. It is not required by melody, lyrics, or detailed style analysis."
+        case .style:
+            "Independent optional CLAP stage for instrumentation, vocals, mood, production, and pace descriptors."
+        case .mlxWhisper:
+            "Apple Silicon lyrics backend. This is an alternative to the Transformers Whisper model."
+        case .vocalActivity:
+            "Optional pre-pass used only by lyric transcription to focus Whisper on likely singing regions."
+        }
+    }
+
     var required: Bool { self == .melody }
 
     var installName: String { rawValue }
@@ -69,7 +103,8 @@ enum CoverComponent: String, CaseIterable, Identifiable, Hashable {
             return [hub.appendingPathComponent("models--m-a-p--SheetSage2", isDirectory: true),
                     hub.appendingPathComponent("models--m-a-p--MERT-v2-FullSong", isDirectory: true)]
         case .lyrics:
-            return [hub.appendingPathComponent("models--openai--whisper-large-v3-turbo", isDirectory: true)]
+            return [hub.appendingPathComponent("models--openai--whisper-large-v3-turbo", isDirectory: true),
+                    hub.appendingPathComponent("models--openai--whisper-small", isDirectory: true)]
         case .genre:
             return [hub.appendingPathComponent("models--dima806--music_genres_classification", isDirectory: true)]
         case .style:
