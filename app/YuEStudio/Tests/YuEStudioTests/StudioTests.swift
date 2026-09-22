@@ -170,6 +170,11 @@ final class StudioTests: XCTestCase {
         XCTAssertEqual(CoverComponent.allCases.filter(\.required).map(\.rawValue), ["melody"])
         XCTAssertTrue(CoverComponent.mlxWhisper.detail.contains("falls back"))
         XCTAssertTrue(CoverComponent.genre.detail.contains("excerpts"))
+        XCTAssertEqual(CoverComponent.melody.models, ["m-a-p/SheetSage2", "m-a-p/MERT-v2-FullSong"])
+        XCTAssertTrue(CoverComponent.lyrics.models.contains("openai/whisper-large-v3-turbo"))
+        XCTAssertTrue(CoverComponent.lyrics.relationship.contains("alternative to MLX Whisper"))
+        XCTAssertTrue(CoverComponent.mlxWhisper.relationship.contains("alternative to the Transformers Whisper model"))
+        XCTAssertTrue(CoverComponent.vocalActivity.relationship.contains("only by lyric transcription"))
         XCTAssertNotEqual(CoverComponent.melody.modelPaths, CoverComponent.lyrics.modelPaths)
         XCTAssertNotEqual(CoverComponent.mlxWhisper.marker, CoverComponent.style.marker)
     }

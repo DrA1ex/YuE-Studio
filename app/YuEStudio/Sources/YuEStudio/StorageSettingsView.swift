@@ -9,7 +9,7 @@ enum StorageTarget: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .mainModels: "YuE2 model"
-        case .coverModels: "Cover transcription models"
+        case .coverModels: "All cover model files"
         case .coverAnalysisCache: "Cover analysis cache"
         case .aneCache: "Neural Engine cache"
         case .coverInstallCache: "Cover installer cache"
@@ -21,7 +21,7 @@ enum StorageTarget: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .mainModels: "Main generation model. If removed, YuE Studio will ask to download it again before generating."
-        case .coverModels: "SheetSage2, MERT2, Whisper, MLX Whisper, Hybrid Demucs, genre classification and CLAP style analysis."
+        case .coverModels: "Bulk cleanup for every cover-analysis model and the isolated MLX Whisper environment. Individual model groups can be removed below."
         case .coverAnalysisCache: "Resumable melody, lyric, genre and style evidence keyed by source audio."
         case .aneCache: "Compiled Neural Engine programs. They are regenerated automatically when needed."
         case .coverInstallCache: "Temporary package files used by the cover engine installer."
@@ -169,7 +169,7 @@ struct StorageSettingsView: View {
         Form {
             Section("Audio analysis engine") {
                 Text(backend.coverRuntimeReady ? "Installed · ready for analysis" : "Engine installation required")
-                Text("Only Melody and score is required. Optional analysis stages and the preferred lyrics backend are configured below.")
+                Text("Only Melody and score is required. Configure optional analysis stages below; the model manager shows the exact downloads, purpose, and disk usage for each component.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Install enabled components") {
@@ -205,7 +205,7 @@ struct StorageSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Section("Analysis components") {
+            Section("Cover model manager") {
                 ForEach(CoverComponent.allCases) { component in
                     componentRow(component)
                 }
@@ -327,6 +327,15 @@ struct StorageSettingsView: View {
                     Text(component.detail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(component.models.joined(separator: " · "))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(component.relationship)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 8)
