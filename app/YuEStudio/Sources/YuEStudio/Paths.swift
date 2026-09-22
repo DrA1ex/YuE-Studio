@@ -44,6 +44,20 @@ struct Paths {
     static var coverRequirements: URL { packaged ? src.appendingPathComponent("tools/sheetsage-requirements.txt") : repoRoot.appendingPathComponent("tools/sheetsage-requirements.txt") }
     static var coverWhisperRequirements: URL { packaged ? src.appendingPathComponent("tools/whisper-requirements.txt") : repoRoot.appendingPathComponent("tools/whisper-requirements.txt") }
     static var coverSeparationModel: URL { coverSupport.appendingPathComponent("torch/torchaudio/models/hdemucs_high_musdbhq_only.pt") }
+    static var ffmpeg: URL? {
+        if let override = ProcessInfo.processInfo.environment["YUE_STUDIO_FFMPEG"] {
+            let url = URL(fileURLWithPath: override)
+            return FileManager.default.isExecutableFile(atPath: url.path) ? url : nil
+        }
+        let candidates = [
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/opt/local/bin/ffmpeg"
+        ]
+        return candidates.lazy.map(URL.init(fileURLWithPath:)).first {
+            FileManager.default.isExecutableFile(atPath: $0.path)
+        }
+    }
     static var installedMarker: URL { support.appendingPathComponent("installed.json") }
     static var bundledVersion: String { (try? String(contentsOf: payload!.appendingPathComponent("version.txt"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "dev" }
     static var workerEnvironment: [String: String] {

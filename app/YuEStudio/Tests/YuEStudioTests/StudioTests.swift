@@ -118,12 +118,36 @@ final class StudioTests: XCTestCase {
         XCTAssertNotNil(backend.errorMessage); XCTAssertFalse(backend.busy)
     }
 
-    @MainActor func testExistingRuntimeSurvivesOrdinaryAppVersionChanges() {
-        XCTAssertTrue(Installer.installationIsUsable(pythonPresent: true, modelsPresent: true, installedSchema: nil))
-        XCTAssertTrue(Installer.installationIsUsable(pythonPresent: true, modelsPresent: true, installedSchema: Installer.runtimeSchema))
-        XCTAssertFalse(Installer.installationIsUsable(pythonPresent: false, modelsPresent: true, installedSchema: Installer.runtimeSchema))
-        XCTAssertFalse(Installer.installationIsUsable(pythonPresent: true, modelsPresent: false, installedSchema: Installer.runtimeSchema))
-        XCTAssertFalse(Installer.installationIsUsable(pythonPresent: true, modelsPresent: true, installedSchema: Installer.runtimeSchema + 1))
+    @MainActor func testInstallerDetectsMissingOrOutdatedDependencies() {
+        XCTAssertTrue(Installer.installationIsUsable(pythonPresent: true, modelsPresent: true, ffmpegPresent: true,
+                                                      installedSchema: nil, versionCurrent: true))
+        XCTAssertTrue(Installer.installationIsUsable(pythonPresent: true, modelsPresent: true, ffmpegPresent: true,
+                                                      installedSchema: Installer.runtimeSchema, versionCurrent: true))
+        XCTAssertFalse(Installer.installationIsUsable(pythonPresent: false, modelsPresent: true, ffmpegPresent: true,
+                                                       installedSchema: Installer.runtimeSchema, versionCurrent: true))
+        XCTAssertFalse(Installer.installationIsUsable(pythonPresent: true, modelsPresent: false, ffmpegPresent: true,
+                                                       installedSchema: Installer.runtimeSchema, versionCurrent: true))
+        XCTAssertFalse(Installer.installationIsUsable(pythonPresent: true, modelsPresent: true, ffmpegPresent: false,
+                                                       installedSchema: Installer.runtimeSchema, versionCurrent: true))
+        XCTAssertFalse(Installer.installationIsUsable(pythonPresent: true, modelsPresent: true, ffmpegPresent: true,
+                                                       installedSchema: Installer.runtimeSchema, versionCurrent: false))
+        XCTAssertFalse(Installer.installationIsUsable(pythonPresent: true, modelsPresent: true, ffmpegPresent: true,
+                                                       installedSchema: Installer.runtimeSchema + 1, versionCurrent: true))
+    }
+
+    func testAudioTranscoderUsesStableInternalWAVAndHighQualityMP3() {
+        let input = URL(fileURLWithPath: "/tmp/input.m4a")
+        let wav = URL(fileURLWithPath: "/tmp/output.wav")
+        let mp3 = URL(fileURLWithPath: "/tmp/output.mp3")
+        let importArgs = AudioTranscoder.importArguments(source: input, destination: wav)
+        XCTAssertTrue(importArgs.contains("pcm_s16le"))
+        XCTAssertEqual(importArgs[importArgs.firstIndex(of: "-ar")! + 1], "48000")
+        XCTAssertEqual(importArgs.last, wav.path)
+
+        let exportArgs = AudioTranscoder.exportArguments(source: wav, destination: mp3)
+        XCTAssertTrue(exportArgs.contains("libmp3lame"))
+        XCTAssertEqual(exportArgs[exportArgs.firstIndex(of: "-b:a")! + 1], "320k")
+        XCTAssertEqual(exportArgs.last, mp3.path)
     }
 
     func testCoverComponentsHaveIndependentInstallableRoles() {

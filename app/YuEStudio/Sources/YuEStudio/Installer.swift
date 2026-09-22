@@ -10,7 +10,8 @@ final class Installer: ObservableObject {
     struct Step: Identifiable { let id: Int; let title: String; var done = false }
     @Published var state: State = .checking
     @Published var steps: [Step] = [Step(id: 0, title: "Copy YuE source"), Step(id: 1, title: "Install Python 3.12"), Step(id: 2, title: "Create environment"),
-                                     Step(id: 3, title: "Install packages (about 1 GB)"), Step(id: 4, title: "Download the music model (about 7 GB)"), Step(id: 5, title: "Finish")]
+                                     Step(id: 3, title: "Install or update packages"), Step(id: 4, title: "Install FFmpeg"),
+                                     Step(id: 5, title: "Download the music model (about 7 GB)"), Step(id: 6, title: "Finish")]
     @Published var current = 0
     @Published var progress = 0.0
     @Published var detail = ""
@@ -22,8 +23,10 @@ final class Installer: ObservableObject {
     private var mainModelURL: URL { Paths.models.appendingPathComponent("hub/models--m-a-p--YuE2-3B") }
     private var vaeModelURL: URL { Paths.models.appendingPathComponent("hub/models--m-a-p--YuE2-Vae") }
 
-    static func installationIsUsable(pythonPresent: Bool, modelsPresent: Bool, installedSchema: Int?) -> Bool {
-        pythonPresent && modelsPresent && (installedSchema == nil || installedSchema == runtimeSchema)
+    static func installationIsUsable(pythonPresent: Bool, modelsPresent: Bool, ffmpegPresent: Bool,
+                                     installedSchema: Int?, versionCurrent: Bool) -> Bool {
+        pythonPresent && modelsPresent && ffmpegPresent && versionCurrent
+            && (installedSchema == nil || installedSchema == runtimeSchema)
     }
 
     private func installedInfo() -> [String: Any] {
@@ -59,18 +62,12 @@ final class Installer: ObservableObject {
         let pythonPresent = fm.isExecutableFile(atPath: Paths.python.path)
         let modelsPresent = fm.fileExists(atPath: mainModelURL.path) && fm.fileExists(atPath: vaeModelURL.path)
         let schema = info["runtime_schema"] as? Int
-        guard Self.installationIsUsable(pythonPresent: pythonPresent, modelsPresent: modelsPresent, installedSchema: schema) else {
-            state = .needed; return
-        }
-        if info["version"] as? String != Paths.bundledVersion || schema == nil {
-            do {
-                try refreshBundledSource()
-                try writeInstalledMarker()
-                append("Existing models and runtime reused for this app update")
-            } catch {
-                append("Could not refresh app resources: \(error.localizedDescription)")
-                state = .needed; return
-            }
+        let versionCurrent = info["version"] as? String == Paths.bundledVersion
+        guard Self.installationIsUsable(pythonPresent: pythonPresent, modelsPresent: modelsPresent,
+                                        ffmpegPresent: Paths.ffmpeg != nil, installedSchema: schema,
+                                        versionCurrent: versionCurrent) else {
+            state = .needed
+            return
         }
         state = .ready
     }
@@ -96,17 +93,33 @@ final class Installer: ObservableObject {
         let env: [String: String] = ["UV_PYTHON_INSTALL_DIR": support.appendingPathComponent("python").path,
                                      "UV_CACHE_DIR": support.appendingPathComponent("uv-cache").path,
                                      "HF_HOME": Paths.models.path, "HF_HUB_DISABLE_TELEMETRY": "1",
-                                     "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": NSHomeDirectory()]
+                                     "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                                     "HOME": NSHomeDirectory()]
         task = Task { [weak self] in
             guard let self else { return }
             do {
                 try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
                 try FileManager.default.createDirectory(at: Paths.output, withIntermediateDirectories: true)
-                try await step(0) { try await self.run("/usr/bin/rsync", ["-a", "--delete", payload.appendingPathComponent("yue2-src").path + "/", Paths.src.path + "/"], env) }
+                try await step(0) {
+                    try await self.run("/usr/bin/rsync", ["-a", "--delete",
+                        payload.appendingPathComponent("yue2-src").path + "/", Paths.src.path + "/"], env)
+                }
                 try await step(1) { try await self.run(uv, ["python", "install", "3.12"], env) }
-                try await step(2) { try await self.run(uv, ["venv", support.appendingPathComponent("env").path, "--python", "3.12", "--clear"], env) }
-                try await step(3) { try await self.run(uv, ["pip", "install", "--python", Paths.python.path, Paths.src.path + "[apple]"], env) }
-                try await step(4) {
+                try await step(2) {
+                    if FileManager.default.isExecutableFile(atPath: Paths.python.path) {
+                        self.detail = "Existing environment found · reusing it"
+                        self.append("Python environment already exists; keeping installed packages")
+                    } else {
+                        try await self.run(uv, ["venv", support.appendingPathComponent("env").path,
+                                                "--python", "3.12", "--clear"], env)
+                    }
+                }
+                try await step(3) {
+                    try await self.run(uv, ["pip", "install", "--python", Paths.python.path,
+                                            Paths.src.path + "[apple]"], env)
+                }
+                try await step(4) { try await self.ensureFFmpeg(env) }
+                try await step(5) {
                     // The downloader first verifies both pinned snapshots locally. A healthy existing
                     // installation therefore needs no network; missing or corrupt files are repaired.
                     try await self.run(Paths.python.path, [Paths.src.appendingPathComponent("tools/download_models.py").path], env) { [weak self] line in
@@ -136,8 +149,8 @@ final class Installer: ObservableObject {
                         }
                     }
                 }
-                try await step(5) {
-                    try? FileManager.default.removeItem(at: support.appendingPathComponent("uv-cache"))   // ~750 MB, not needed after install
+                try await step(6) {
+                    try? FileManager.default.removeItem(at: support.appendingPathComponent("uv-cache"))
                     try self.writeInstalledMarker()
                 }
                 state = .ready
@@ -145,6 +158,35 @@ final class Installer: ObservableObject {
                 append("Setup failed: \(error.localizedDescription)")
                 state = .failed(error.localizedDescription)
             }
+        }
+    }
+
+    private func ensureFFmpeg(_ env: [String: String]) async throws {
+        if let ffmpeg = Paths.ffmpeg {
+            detail = "Using \(ffmpeg.path)"
+            append("FFmpeg already installed; reusing \(ffmpeg.path)")
+            return
+        }
+
+        let candidates = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+        guard let brew = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw NSError(
+                domain: "YuEStudio.Install",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "FFmpeg is required for audio import and MP3 export. Install Homebrew, then retry setup."]
+            )
+        }
+
+        detail = "Installing with Homebrew"
+        append("FFmpeg is missing; installing it with Homebrew")
+        try await run(brew, ["install", "ffmpeg"], env)
+        guard Paths.ffmpeg != nil else {
+            throw NSError(
+                domain: "YuEStudio.Install",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Homebrew completed, but FFmpeg could not be found."]
+            )
         }
     }
 
